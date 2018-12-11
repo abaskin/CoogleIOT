@@ -1,29 +1,28 @@
 #include <CoogleIOT.h>
 #include "GarageDoor-Opener.h"
 
-CoogleIOT *iot;
-PubSubClient *mqtt;
+CoogleIOT* iot;
 
 GarageDoorState _currentState = GD_UNKNOWN;
 
-String getDoorStateAsString(GarageDoorState state)
+const char* getDoorStateString(GarageDoorState state)
 {
 	switch(state) {
 		case GD_OPEN:
-			return String("open");
+			return "open";
 		case GD_CLOSED:
-			return String("closed");
+			return "closed";
 		case GD_OPENING:
-			return String("opening");
+			return "opening";
 		case GD_CLOSING:
-			return String("closing");
+			return "closing";
 		case GD_UNKNOWN:
-			return String("unknown");
+			return "unknown";
 	}
 
 	iot->warn("Garage Door State Value Unknown!");
 
-	return String("unknown");
+	return "unknown";
 }
 
 GarageDoorState getGarageDoorState()
@@ -91,10 +90,24 @@ void setup()
 	iot = new CoogleIOT(LED_BUILTIN);
 
 	iot->enableSerial(SERIAL_BAUD)
-        .setMQTTClientId(GARAGE_DOOR_MQTT_CLIENT_ID)
-	    .initialize();
+     .MQTTClientId(GARAGE_DOOR_MQTT_CLIENT_ID, false)
+		 .MQTTSubTopic(GARAGE_DOOR_ACTION_TOPIC_DOOR,
+										[=](const char* topic, const char* payload,
+												AsyncMqttClientMessageProperties properties) {
+				iot->info("Handling Garage Door Action Request");
+				iot->flashStatus(200, 1);
+				triggerDoor();	
+			 })
+		 .MQTTSubTopic(GARAGE_DOOR_ACTION_TOPIC_LIGHT,
+										[=](const char* topic, const char* payload,
+												AsyncMqttClientMessageProperties properties) {
+				iot->info("Handing Garage Door Light Request");
+				iot->flashStatus(200, 2);
+				triggerLight();	
+			 })
+	   .initialize();
 
-	pinMode(OPEN_SWTICH_PIN, OUTPUT);
+  pinMode(OPEN_SWTICH_PIN, OUTPUT);
 	pinMode(LIGHT_SWITCH_PIN, OUTPUT);
 	pinMode(OPEN_SENSOR_PIN, INPUT_PULLUP);
 	pinMode(CLOSE_SENSOR_PIN, INPUT_PULLUP);
@@ -103,22 +116,13 @@ void setup()
 	digitalWrite(LIGHT_SWITCH_PIN, HIGH);
 
 	if(iot->mqttActive()) {
-		mqtt = iot->getMQTTClient();
+    iot->MQTTQueueMessage(GARAGE_DOOR_STATUS_TOPIC,
+                    			getDoorStateString(_currentState));
 
-		mqtt->setCallback(mqttCallbackHandler);
+    iot->info("Garage Door Opener Initialized");
 
-		iot->logPrintf(INFO, "Subscribed to Door-Open Topic: %s", GARAGE_DOOR_ACTION_TOPIC_DOOR);
-		iot->logPrintf(INFO, "Subscribed to Light-Activate Topic: %s", GARAGE_DOOR_ACTION_TOPIC_LIGHT);
-
-		mqtt->subscribe(GARAGE_DOOR_ACTION_TOPIC_DOOR);
-		mqtt->subscribe(GARAGE_DOOR_ACTION_TOPIC_LIGHT);
-
-		mqtt->publish(GARAGE_DOOR_STATUS_TOPIC, getDoorStateAsString(_currentState).c_str(), true);
-
-		iot->info("Garage Door Opener Initialized");
-
-	} else {
-		iot->error("MQTT Not initialized, Garage Door Opener Inactive");
+		} else {
+			iot->error("MQTT Not initialized, Garage Door Opener Inactive");
 	}
 }
 
@@ -132,29 +136,9 @@ void loop()
 		liveState = getGarageDoorState();
 
 		if(liveState != _currentState) {
-			mqtt->publish(GARAGE_DOOR_STATUS_TOPIC, getDoorStateAsString(liveState).c_str(), true);
+			iot->MQTTQueueMessage(GARAGE_DOOR_STATUS_TOPIC,
+														getDoorStateString(liveState)); 
 			_currentState = liveState;
-		}
-	}
-
-}
-
-void mqttCallbackHandler(char *topic, byte *payload, unsigned int length)
-{
-	String action;
-	char *payloadStr;
-
-	if(strcmp(topic, GARAGE_DOOR_ACTION_TOPIC_DOOR) == 0) {
-
-		iot->info("Handling Garage Door Action Request");
-		iot->flashStatus(200, 1);
-		triggerDoor();
-
-	} else if(strcmp(topic, GARAGE_DOOR_ACTION_TOPIC_LIGHT) == 0) {
-
-		iot->info("Handing Garage Door Light Request");
-		iot->flashStatus(200, 2);
-		triggerLight();
-
+    }
 	}
 }

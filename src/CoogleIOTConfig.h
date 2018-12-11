@@ -43,8 +43,16 @@
 #define COOGLEIOT_DEFAULT_MQTT_PORT 1883
 #endif
 
+#ifndef COOGLEIOT_DEFAULT_MQTT_QOS
+#define COOGLEIOT_DEFAULT_MQTT_QOS 1
+#endif
+
+#ifndef COOGLEIOT_DEFAULT_MQTT_RETAIN
+#define COOGLEIOT_DEFAULT_MQTT_RETAIN true
+#endif
+
 #ifndef COOGLEIOT_TIMEZONE_OFFSET
-#define COOGLEIOT_TIMEZONE_OFFSET ((3600 * 5) * -1) // Default Timezone is -5 UTC (America/New York)
+#define COOGLEIOT_TIMEZONE_OFFSET 0 // Default Timezone is UTC
 #endif
 
 #ifndef COOGLEIOT_DAYLIGHT_OFFSET

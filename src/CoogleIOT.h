@@ -29,14 +29,21 @@
 
 #include "Arduino.h"
 
-#include <ESP8266WiFi.h>
-#include <WiFiClient.h>
-#include <PubSubClient.h>
+#include <ArduinoJson.h>
+#include <AsyncMqttClient.h>
+#include <ESP8266WiFiMulti.h>
 #include <ESP8266httpUpdate.h>
-#include <time.h>
-#include <stdlib.h>
+#include <WiFiClient.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#include <time.h>
+
+#include <algorithm>
+#include <functional>
+#include <memory>
+#include <queue>
+#include <vector>
 
 #ifndef ARDUINO_ESP8266_ESP01
 #include "DNSServer/DNSServer.h"
@@ -49,17 +56,17 @@
 
 #include <user_interface.h>
 
-typedef enum {
-	DEBUG,
-	INFO,
-	WARNING,
-	ERROR,
-	CRITICAL
-} CoogleIOT_LogSeverity;
+    typedef enum {
+      DEBUG,
+      INFO,
+      WARNING,
+      ERROR,
+      CRITICAL
+    } CoogleIOT_LogSeverity;
 
-typedef void (*sketchtimer_cb_t)();
+using sketchtimer_cb_t = std::function<void(void)>;
 
-extern "C" void __coogle_iot_firmware_timer_callback(void *);
+extern "C" void __coogle_iot_firmware_timer_callback(void*);
 extern "C" void __coogle_iot_heartbeat_timer_callback(void *);
 extern "C" void __coogle_iot_sketch_timer_callback(void *);
 
@@ -68,83 +75,112 @@ class CoogleIOTWebserver;
 class CoogleIOT
 {
     public:
-		bool firmwareUpdateTick = false;
-		bool heartbeatTick = false;
-		bool sketchTimerTick = false;
-		bool _restarting = false;
+     using mqttSubCallback = std::function<void(
+        const char*, const char*, AsyncMqttClientMessageProperties)>;
 
-        CoogleIOT(int);
-        CoogleIOT();
-        ~CoogleIOT();
-        void loop();
-        bool initialize();
-        CoogleIOT& enableSerial(int, SerialConfig, SerialMode);
-        CoogleIOT& enableSerial(int, SerialConfig);
-        CoogleIOT& enableSerial(int);
-        CoogleIOT& enableSerial();
-        PubSubClient* getMQTTClient();
-        bool serialEnabled();
-        CoogleIOT& flashStatus(int);
-        CoogleIOT& flashStatus(int, int);
-        CoogleIOT& flashSOS();
-        	CoogleIOT& resetEEProm();
-        	void restartDevice();
+     using mqttSubTopicEntry = struct {
+       const std::string topic;
+       const mqttSubCallback callBack;
+     };
 
-        String getRemoteAPName();
-        String getRemoteAPPassword();
-        String getMQTTHostname();
-        String getMQTTUsername();
-        String getMQTTPassword();
-        String getMQTTClientId();
-        String getMQTTLWTTopic();
-        String getMQTTLWTMessage();
-        String getAPName();
-        String getAPPassword();
+     using mqttQueueEntry = struct {
+       std::string topic, payload;
+       uint8_t qos;
+       bool retain;
+       uint16_t packetId;
+     };
 
-        String filterAscii(String);
-        int getMQTTPort();
-        String getFirmwareUpdateUrl();
-        String getWiFiStatus();
-        String getTimestampAsString();
+     bool firmwareUpdateTick = false;
+     bool heartbeatTick = false;
+     bool sketchTimerTick = false;
+     bool _restarting = false;
 
-        bool verifyFlashConfiguration();
+     CoogleIOT(int);
+     CoogleIOT();
+     ~CoogleIOT();
+     void loop();
+     bool initialize();
+     CoogleIOT& enableSerial(int, SerialConfig, SerialMode);
+     CoogleIOT& enableSerial(int, SerialConfig);
+     CoogleIOT& enableSerial(int);
+     CoogleIOT& enableSerial();
+     AsyncMqttClient* getMQTTClient();
 
-        CoogleIOT& setMQTTPort(int);
-        CoogleIOT& setMQTTHostname(String);
-        CoogleIOT& setMQTTUsername(String);
-        CoogleIOT& setMQTTPassword(String);
-        CoogleIOT& setMQTTLWTTopic(String);
-        CoogleIOT& setMQTTLWTMessage(String);
-        CoogleIOT& setRemoteAPName(String);
-        CoogleIOT& setRemoteAPPassword(String);
-        CoogleIOT& setMQTTClientId(String);
-        CoogleIOT& setAPName(String);
-        CoogleIOT& setAPPassword(String);
-        CoogleIOT& setFirmwareUpdateUrl(String);
-        CoogleIOT& syncNTPTime(int, int);
+     bool serialEnabled();
 
-        CoogleIOT& warn(String);
-        CoogleIOT& error(String);
-        CoogleIOT& critical(String);
-        CoogleIOT& log(String, CoogleIOT_LogSeverity);
-        CoogleIOT& logPrintf(CoogleIOT_LogSeverity, const char *format, ...);
-        CoogleIOT& debug(String);
-        CoogleIOT& info(String);
+     CoogleIOT& flashStatus(int);
+     CoogleIOT& flashStatus(int, int);
+     CoogleIOT& flashSOS();
+     CoogleIOT& resetEEProm();
 
-        CoogleIOT& registerTimer(int, sketchtimer_cb_t);
+     void restartDevice();
 
-        String buildLogMsg(String, CoogleIOT_LogSeverity);
-        String getLogs(bool);
-        String getLogs();
-        File& getLogFile();
+     const char* RemoteAPName();
+     const char* RemoteAPPassword();
+     const char* MQTTHostname();
+     const char* MQTTUsername();
+     const char* MQTTPassword();
+     const char* MQTTClientId();
+     const char* MQTTLWTTopic();
+     const char* MQTTLWTMessage();
+     const char* APName();
+     const char* APPassword();
+     const char* FirmwareUpdateUrl();
 
-        bool mqttActive();
-        bool dnsActive();
-        bool ntpActive();
-        bool firmwareClientActive();
-        bool apStatus();
+     int MQTTPort();
+     int MQTTQoS();
+     
+     String WiFiStatus();
+     String TimestampAsString();
 
-        void checkForFirmwareUpdate();
+     bool verifyFlashConfiguration();
+     bool MQTTRetain();
+     bool writeConfig();
+
+     CoogleIOT& MQTTPort(int, bool = true);
+     CoogleIOT& MQTTHostname(const char*, bool = true);
+     CoogleIOT& MQTTUsername(const char* g, bool = true);
+     CoogleIOT& MQTTPassword(const char*, bool = true);
+     CoogleIOT& MQTTLWTTopic(const char*, bool = true);
+     CoogleIOT& MQTTLWTMessage(const char*, bool = true);
+     CoogleIOT& MQTTClientId(const char*, bool = true);
+
+     CoogleIOT& MQTTQoS(int);
+     CoogleIOT& MQTTRetain(bool);
+     CoogleIOT& MQTTSubTopic(const char*, mqttSubCallback);
+     CoogleIOT& MQTTQueueMessage(const char*, const char*);
+     CoogleIOT& MQTTQueueMessage(const char*, uint8_t, bool, const char*);
+     CoogleIOT& MQTTProcessQueue();
+
+     CoogleIOT& RemoteAPName(const char*, bool = true);
+     CoogleIOT& RemoteAPPassword(const char*, bool = true);
+     CoogleIOT& APName(const char*, bool = true);
+     CoogleIOT& APPassword(const char*, bool = true);
+     CoogleIOT& FirmwareUpdateUrl(const char*, bool = true);
+     CoogleIOT& syncNTPTime(int, int);
+
+     CoogleIOT& warn(String);
+     CoogleIOT& error(String);
+     CoogleIOT& critical(String);
+     CoogleIOT& log(String, CoogleIOT_LogSeverity);
+     CoogleIOT& logPrintf(CoogleIOT_LogSeverity, const char* format, ...);
+     CoogleIOT& debug(String);
+     CoogleIOT& info(String);
+
+     CoogleIOT& registerTimer(int, sketchtimer_cb_t);
+
+     String buildLogMsg(String, CoogleIOT_LogSeverity);
+     String Logs(bool);
+     String Logs();
+     File& LogFile();
+
+     bool mqttActive();
+     bool dnsActive();
+     bool ntpActive();
+     bool firmwareClientActive();
+     bool apStatus();
+
+     void checkForFirmwareUpdate();
 
     private:
 
@@ -158,8 +194,8 @@ class CoogleIOT
         DNSServer dnsServer;
 #endif
 
-        WiFiClient espClient;
-        PubSubClient *mqttClient;
+        ESP8266WiFiMulti wifiMulti;
+        AsyncMqttClient mqttClient;
         CoogleEEProm eeprom;
         CoogleIOTWebserver *webServer;
         File logFile;
@@ -185,6 +221,30 @@ class CoogleIOT
         bool connectToSSID();
         bool initializeMQTT();
         bool connectToMQTT();
+
+        bool mqttRetain = COOGLEIOT_DEFAULT_MQTT_RETAIN;
+        int mqttQoS = COOGLEIOT_DEFAULT_MQTT_QOS;
+
+        std::vector<mqttSubTopicEntry> mqttSubTopicList;
+
+        std::queue<mqttQueueEntry> mqttPublishQueue;
+
+        DynamicJsonDocument cfgJsonDoc;
+        JsonObject cfgJson;
+
+        const char* cfgJsonDefault = R"({
+            "ap" : { "name" : "", "pass" : "" },
+            "remote_ap" : { "name" : "", "pass" : "" },
+            "mqtt" : {
+                "host" : "",
+                "user" : "",
+                "pass" : "",
+                "client_id" : "",
+                "port" : 0,
+                "lwt" : { "topic" : "", "message" : "" }
+            },
+            "fw_upd_url" : ""
+        })";
 };
 
 #endif

@@ -53,7 +53,6 @@ CoogleIOT::CoogleIOT()
 
 CoogleIOT::~CoogleIOT()
 {
-	delete mqttClient;
 	delete webServer;
 
 	if(logFile) {
@@ -74,6 +73,7 @@ CoogleIOT::~CoogleIOT()
 	os_timer_disarm(&heartbeatTimer);
 }
 
+// Time
 CoogleIOT& CoogleIOT::registerTimer(int interval, sketchtimer_cb_t callback)
 {
 	if(interval <= 0) {
@@ -96,7 +96,7 @@ CoogleIOT& CoogleIOT::registerTimer(int interval, sketchtimer_cb_t callback)
 	return *this;
 }
 
-String CoogleIOT::getTimestampAsString()
+String CoogleIOT::TimestampAsString()
 {
 	String timestamp;
 	struct tm* p_tm;
@@ -105,8 +105,8 @@ String CoogleIOT::getTimestampAsString()
 		p_tm = localtime(&now);
 
 		timestamp = timestamp +
-				    (p_tm->tm_year + 1900) + "-" +
-				    (p_tm->tm_mon < 10 ? "0" : "") + p_tm->tm_mon + "-" +
+					(p_tm->tm_year + 1900) + "-" +
+					(p_tm->tm_mon < 10 ? "0" : "") + p_tm->tm_mon + "-" +
 					(p_tm->tm_mday < 10 ? "0" : "") + p_tm->tm_mday + " " +
 					(p_tm->tm_hour < 10 ? "0" : "") + p_tm->tm_hour + ":" +
 					(p_tm->tm_min < 10 ? "0" : "") + p_tm->tm_min + ":" +
@@ -118,35 +118,29 @@ String CoogleIOT::getTimestampAsString()
 	return timestamp;
 }
 
+// Logging
 String CoogleIOT::buildLogMsg(String msg, CoogleIOT_LogSeverity severity)
 {
-	String retval;
-	String timestamp;
-
-	timestamp = getTimestampAsString();
-
 	switch(severity) {
 		case DEBUG:
-			retval = "[DEBUG " + timestamp + "] " + msg;
+			return "[DEBUG " + TimestampAsString() + "] " + msg;
 			break;
 		case INFO:
-			retval = "[INFO " + timestamp + "] " + msg;
+			return "[INFO " + TimestampAsString() + "] " + msg;
 			break;
 		case WARNING:
-			retval = "[WARNING " + timestamp + "] " + msg;
+			return "[WARNING " + TimestampAsString() + "] " + msg;
 			break;
 		case ERROR:
-			retval = "[ERROR " + timestamp + "] " + msg;
+			return "[ERROR " + TimestampAsString() + "] " + msg;
 			break;
 		case CRITICAL:
-			retval = "[CRTICAL " + timestamp + "] " + msg;
+			return "[CRTICAL " + TimestampAsString() + "] " + msg;
 			break;
 		default:
-			retval = "[UNKNOWN " + timestamp + "] " + msg;
+			return "[UNKNOWN " + TimestampAsString() + "] " + msg;
 			break;
 	}
-
-	return retval;
 }
 
 CoogleIOT& CoogleIOT::logPrintf(CoogleIOT_LogSeverity severity, const char *format, ...)
@@ -158,8 +152,6 @@ CoogleIOT& CoogleIOT::logPrintf(CoogleIOT_LogSeverity severity, const char *form
     size_t len = vsnprintf(temp, sizeof(temp), format, arg);
     va_end(arg);
 
-    String logMsg;
-
     if (len > sizeof(temp) - 1) {
         buffer = new char[len + 1];
         if (!buffer) {
@@ -170,8 +162,7 @@ CoogleIOT& CoogleIOT::logPrintf(CoogleIOT_LogSeverity severity, const char *form
         va_end(arg);
     }
 
-    logMsg = String(buffer);
-    log(logMsg, severity);
+    log(String(buffer), severity);
 
     if (buffer != temp) {
         delete[] buffer;
@@ -205,17 +196,17 @@ CoogleIOT& CoogleIOT::critical(String msg)
 	return log(msg, CRITICAL);
 }
 
-File& CoogleIOT::getLogFile()
+File& CoogleIOT::LogFile()
 {
 	return logFile;
 }
 
-String CoogleIOT::getLogs()
+String CoogleIOT::Logs()
 {
-	return CoogleIOT::getLogs(false);
+	return CoogleIOT::Logs(false);
 }
 
-String CoogleIOT::getLogs(bool asHTML)
+String CoogleIOT::Logs(bool asHTML)
 {
 	String retval;
 
@@ -270,16 +261,9 @@ bool CoogleIOT::serialEnabled()
 	return _serial;
 }
 
+// Loop
 void CoogleIOT::loop()
 {
-	struct tm* p_tm;
-	String remoteAPName;
-	String mqttClientId;
-
-	char topic[150];
-	char json[150];
-
-
 	if(sketchTimerTick) {
 		sketchTimerTick = false;
 		sketchTimerCallback();
@@ -295,36 +279,31 @@ void CoogleIOT::loop()
 			return;
 		}
 
-		if((mqttFailuresCount > COOGLEIOT_MAX_MQTT_ATTEMPTS) && !mqttClient->connected()) {
+		if((mqttFailuresCount > COOGLEIOT_MAX_MQTT_ATTEMPTS) && !mqttClient.connected()) {
 			info("Failed too many times to establish a MQTT connection. Restarting Device.");
 			restartDevice();
 			return;
 		}
 
 		if(mqttClientActive) {
-
-			mqttClientId = getMQTTClientId();
-
+			char topic[150];
+			char json[150];
+			
 			snprintf(json, 150, "{ \"timestamp\" : \"%s\", \"ip\" : \"%s\", \"coogleiot_version\" : \"%s\", \"client_id\" : \"%s\" }",
-					getTimestampAsString().c_str(),
+					TimestampAsString().c_str(),
 					WiFi.localIP().toString().c_str(),
 					COOGLEIOT_VERSION,
-					mqttClientId.c_str());
+					MQTTClientId());
 
-			snprintf(topic, 150, COOGLEIOT_DEVICE_TOPIC "/%s", mqttClientId.c_str());
+			snprintf(topic, 150, COOGLEIOT_DEVICE_TOPIC "/%s", MQTTClientId());
 
-			if(!mqttClient->publish(topic, json, true)) {
-				error("Failed to publish to heartbeat topic!");
-			}
+			MQTTQueueMessage(topic, mqttQoS, mqttRetain, json);
 		}
 
 	}
 
-	if(WiFi.status() != WL_CONNECTED) {
-
-		remoteAPName = getRemoteAPName();
-
-		if(remoteAPName.length() > 0) {
+	if(wifiMulti.run() != WL_CONNECTED) {
+		if(strlen(RemoteAPName()) > 0) {
 			info("Not connected to WiFi. Attempting reconnection.");
 			if(!connectToSSID()) {
 				wifiFailuresCount++;
@@ -337,7 +316,7 @@ void CoogleIOT::loop()
 
 		wifiFailuresCount = 0;
 
-		if(!mqttClient->connected()) {
+		if(!mqttClient.connected()) {
 			yield();
 			if(!connectToMQTT()) {
 				mqttFailuresCount++;
@@ -346,15 +325,15 @@ void CoogleIOT::loop()
 
 		if(mqttClientActive) {
 			mqttFailuresCount = 0;
+			MQTTProcessQueue();
 			yield();
-			mqttClient->loop();
-		}
+    }
 
 		if(ntpClientActive) {
 			now = time(nullptr);
 
 			if(now) {
-				p_tm = localtime(&now);
+				struct tm* p_tm = localtime(&now);
 
 				if( (p_tm->tm_hour == 12) &&
 					(p_tm->tm_min == 0) &&
@@ -447,30 +426,26 @@ bool CoogleIOT::apStatus()
 	return _apStatus;
 }
 
-String CoogleIOT::getWiFiStatus()
+String CoogleIOT::WiFiStatus()
 {
-	String retval;
-
     switch(WiFi.status()) {
         case WL_CONNECTED:
-            retval = "Connected";
+            return "Connected";
             break;
         case WL_NO_SSID_AVAIL:
-            retval = "No SSID Available";
+            return "No SSID Available";
             break;
         case WL_CONNECT_FAILED:
-            retval = "Failed to Connect";
+            return "Failed to Connect";
             break;
         case WL_IDLE_STATUS:
-            retval = "Idle";
+            return "Idle";
             break;
         case WL_DISCONNECTED:
         default:
-            retval = "Disconnected";
+            return "Disconnected";
             break;
     }
-
-    return retval;
 }
 
 CoogleIOT& CoogleIOT::syncNTPTime(int offsetSeconds, int daylightOffsetSec)
@@ -522,11 +497,9 @@ CoogleIOT& CoogleIOT::flashStatus(int speed, int repeat)
 	return *this;
 }
 
+// Initialize
 bool CoogleIOT::initialize()
 {
-	String firmwareUrl;
-	String localAPName;
-
 	if(_statusPin > -1) {
 		pinMode(_statusPin, OUTPUT);
 		flashStatus(COOGLEIOT_STATUS_INIT);
@@ -542,14 +515,27 @@ bool CoogleIOT::initialize()
 
 	SPIFFS.begin();
 
-	if(!eeprom.isApp((const byte *)COOGLEIOT_MAGIC_BYTES)) {
+	int cfgSize;
+	eeprom.readInt(0, &cfgSize);
 
+	DeserializationError err = DeserializationError::InvalidInput;
+	if (cfgSize || cfgSize <= COOGLE_EEPROM_EEPROM_SIZE) {
+		std::unique_ptr<char[]> buff(new char[cfgSize]);
+		eeprom.readString(sizeof(int), buff.get(), cfgSize);
+		err = deserializeMsgPack(cfgJsonDoc, buff.get(), cfgSize);
+	}
+
+	if (err) {
 		info("EEPROM not initialized for platform, erasing..");
 
 		eeprom.reset();
-		eeprom.setApp((const byte *)COOGLEIOT_MAGIC_BYTES);
 		SPIFFS.format();
+
+		deserializeJson(cfgJsonDoc, cfgJsonDefault);
+		writeConfig();
 	}
+
+	cfgJson = cfgJsonDoc.as<JsonObject>();
 
 	logFile = SPIFFS.open(COOGLEIOT_SPIFFS_LOGFILE, "a+");
 
@@ -559,15 +545,8 @@ bool CoogleIOT::initialize()
 		info("Log file successfully opened");
 	}
 
-	WiFi.disconnect();
-	WiFi.setAutoConnect(false);
-	WiFi.setAutoReconnect(true);
-	WiFi.mode(WIFI_AP_STA);
-
-	localAPName = getAPName();
-
-	if(localAPName.length() > 0) {
-		WiFi.hostname(localAPName.c_str());
+	if(strlen(APName()) > 0) {
+		WiFi.hostname(APName());
 	}
 
 	if(!connectToSSID()) {
@@ -587,9 +566,7 @@ bool CoogleIOT::initialize()
 
 	enableConfigurationMode();
 
-	firmwareUrl = getFirmwareUpdateUrl();
-
-	if(firmwareUrl.length() > 0) {
+	if(strlen(FirmwareUpdateUrl()) > 0) {
 		os_timer_setfn(&firmwareUpdateTimer, __coogle_iot_firmware_timer_callback, NULL);
 		os_timer_arm(&firmwareUpdateTimer, COOGLEIOT_FIRMWARE_UPDATE_CHECK_MS, true);
 
@@ -654,40 +631,33 @@ void CoogleIOT::enableConfigurationMode()
 
 void CoogleIOT::initializeLocalAP()
 {
-	String localAPName, localAPPassword;
-
 	IPAddress apLocalIP(192,168,0,1);
 	IPAddress apSubnetMask(255,255,255,0);
 	IPAddress apGateway(192,168,0,1);
 
-	localAPName = getAPName();
-	localAPPassword = getAPPassword();
-
-	if(localAPPassword.length() == 0) {
+	if(strlen(APPassword()) == 0) {
 		info("No AP Password found in memory");
 		info("Setting to default password: " COOGLEIOT_AP_DEFAULT_PASSWORD);
 
-		localAPPassword = COOGLEIOT_AP_DEFAULT_PASSWORD;
-		setAPPassword(localAPPassword);
-
+		APPassword(COOGLEIOT_AP_DEFAULT_PASSWORD);
 	}
 
-	if(localAPName.length() == 0) {
+	if(strlen(APName()) == 0) {
 		info("No AP Name found in memory. Auto-generating AP name.");
 
-		localAPName = COOGLEIOT_AP;
+		String localAPName = COOGLEIOT_AP;
 		localAPName.concat((int)random(100000, 999999));
 
 		info("Setting AP Name To: " );
 		info(localAPName);
 
-		setAPName(localAPName);
+		APName(localAPName.c_str());
 	}
 
 	info("Intiailzing Access Point");
 
 	WiFi.softAPConfig(apLocalIP, apGateway, apSubnetMask);
-	WiFi.softAP(localAPName.c_str(), localAPPassword.c_str());
+	WiFi.softAP(APName(), APPassword());
 
 	info("Local IP Address: ");
 	info(WiFi.softAPIP().toString());
@@ -712,260 +682,214 @@ void CoogleIOT::initializeLocalAP()
 
 }
 
-String CoogleIOT::getFirmwareUpdateUrl()
-{
-	char firmwareUrl[COOGLEIOT_FIRMWARE_UPDATE_URL_MAXLEN];
-
-	if(!eeprom.readString(COOGLEIOT_FIRMWARE_UPDATE_URL_ADDR, firmwareUrl, COOGLEIOT_FIRMWARE_UPDATE_URL_MAXLEN)) {
-		error("Failed to read Firmware Update URL from EEPROM");
-	}
-
-	String retval(firmwareUrl);
-	return filterAscii(retval);
+// Getters
+const char* CoogleIOT::FirmwareUpdateUrl() {
+  return cfgJson["fw_upd_url"].as<const char*>();
 }
 
-String CoogleIOT::getMQTTHostname()
-{
-	char mqttHost[COOGLEIOT_MQTT_HOST_MAXLEN];
-
-	if(!eeprom.readString(COOGLEIOT_MQTT_HOST_ADDR, mqttHost, COOGLEIOT_MQTT_HOST_MAXLEN)) {
-		error("Failed to read MQTT Server Hostname from EEPROM");
-	}
-
-	String retval(mqttHost);
-	return filterAscii(retval);
+const char* CoogleIOT::MQTTHostname() {
+  return cfgJson["mqtt"]["host"].as<const char*>();
 }
 
-String CoogleIOT::getMQTTClientId()
-{
-	char mqtt[COOGLEIOT_MQTT_CLIENT_ID_MAXLEN];
-
-	if(!eeprom.readString(COOGLEIOT_MQTT_CLIENT_ID_ADDR, mqtt, COOGLEIOT_MQTT_CLIENT_ID_MAXLEN)) {
-		error("Failed to read MQTT Client ID from EEPROM");
-	}
-
-	String retval(mqtt);
-	return filterAscii(retval);
+const char* CoogleIOT::MQTTClientId() {
+  return cfgJson["mqtt"]["client_id"].as<const char*>();
 }
 
-String CoogleIOT::getMQTTUsername()
-{
-	char mqtt[COOGLEIOT_MQTT_USER_MAXLEN];
-
-	if(!eeprom.readString(COOGLEIOT_MQTT_USER_ADDR, mqtt, COOGLEIOT_MQTT_USER_MAXLEN)) {
-		error("Failed to read MQTT Username from EEPROM");
-	}
-
-	String retval(mqtt);
-	return filterAscii(retval);
+const char* CoogleIOT::MQTTUsername() {
+  return cfgJson["mqtt"]["user"].as<const char*>();
 }
 
-String CoogleIOT::getMQTTPassword()
-{
-	char mqtt[COOGLEIOT_MQTT_USER_PASSWORD_MAXLEN];
-
-	if(!eeprom.readString(COOGLEIOT_MQTT_USER_PASSWORD_ADDR, mqtt, COOGLEIOT_MQTT_USER_PASSWORD_MAXLEN)) {
-		error("Failed to read MQTT Password from EEPROM");
-	}
-
-	String retval(mqtt);
-	return filterAscii(retval);
+const char* CoogleIOT::MQTTPassword() {
+  return cfgJson["mqtt"]["pass"].as<const char*>();
 }
 
-String CoogleIOT::getMQTTLWTTopic()
-{
-	char mqtt[COOGLEIOT_MQTT_LWT_TOPIC_MAXLEN];
-
-	if(!eeprom.readString(COOGLEIOT_MQTT_LWT_TOPIC_ADDR, mqtt, COOGLEIOT_MQTT_LWT_TOPIC_MAXLEN)) {
-		error("Failed to read MQTT LWT Topic from EEPROM");
-	}
-
-	String retval(mqtt);
-	return filterAscii(retval);
+const char* CoogleIOT::MQTTLWTTopic() {
+  return cfgJson["mqtt"]["lwt"]["topic"].as<const char*>();
 }
 
-String CoogleIOT::getMQTTLWTMessage()
-{
-	char mqtt[COOGLEIOT_MQTT_LWT_MESSAGE_MAXLEN];
-
-	if(!eeprom.readString(COOGLEIOT_MQTT_LWT_MESSAGE_ADDR, mqtt, COOGLEIOT_MQTT_LWT_MESSAGE_MAXLEN)) {
-		error("Failed to read MQTT LWT Message from EEPROM");
-	}
-
-	String retval(mqtt);
-	return filterAscii(retval);
+const char* CoogleIOT::MQTTLWTMessage() {
+  return cfgJson["mqtt"]["lwt"]["message"].as<const char*>();
 }
 
-int CoogleIOT::getMQTTPort()
-{
-	int mqtt;
-
-	if(!eeprom.readInt(COOGLEIOT_MQTT_PORT_ADDR, &mqtt)) {
-		error("Failed to read MQTT Port from EEPROM");
-	}
-
-	return mqtt;
+int CoogleIOT::MQTTPort() {
+	return cfgJson["mqtt"]["port"].as<int>();
 }
 
-CoogleIOT& CoogleIOT::setMQTTPort(int port)
-{
-	if(!eeprom.writeInt(COOGLEIOT_MQTT_PORT_ADDR, port)) {
-		error("Failed to write MQTT Port to EEPROM");
-	}
-
-	return *this;
+bool CoogleIOT::MQTTRetain() {
+  return mqttRetain;
 }
 
-CoogleIOT& CoogleIOT::setFirmwareUpdateUrl(String s)
-{
-	if(s.length() > COOGLEIOT_FIRMWARE_UPDATE_URL_MAXLEN) {
-		warn("Attempted to write beyond max length for Firmware Update URL");
-		return *this;
-	}
-
-	if(!eeprom.writeString(COOGLEIOT_FIRMWARE_UPDATE_URL_ADDR, s)) {
-		error("Failed to write Firmware Update URL to EEPROM");
-	}
-
-	return *this;
+int CoogleIOT::MQTTQoS() {
+  return mqttQoS;
 }
 
-CoogleIOT& CoogleIOT::setMQTTClientId(String s)
-{
-	if(s.length() > COOGLEIOT_MQTT_CLIENT_ID_MAXLEN) {
-		warn("Attempted to write beyond max length for MQTT Client ID");
-		return *this;
-	}
-
-	if(!eeprom.writeString(COOGLEIOT_MQTT_CLIENT_ID_ADDR, s)) {
-		error("Failed to write MQTT Client ID to EEPROM");
-	}
-
-	return *this;
+const char* CoogleIOT::RemoteAPName() {
+  return cfgJson["remote_ap"]["name"].as<const char*>();
 }
 
-CoogleIOT& CoogleIOT::setMQTTHostname(String s)
-{
-	if(s.length() > COOGLEIOT_MQTT_HOST_MAXLEN) {
-		warn("Attempted to write beyond max length for MQTT Hostname");
-		return *this;
-	}
-
-	if(!eeprom.writeString(COOGLEIOT_MQTT_HOST_ADDR, s)) {
-		error("Failed to write MQTT Hostname to EEPROM");
-	}
-
-	return *this;
+const char* CoogleIOT::RemoteAPPassword() {
+  return cfgJson["remote_ap"]["pass"].as<const char*>();
 }
 
-CoogleIOT& CoogleIOT::setMQTTUsername(String s)
-{
-	if(s.length() > COOGLEIOT_MQTT_USER_MAXLEN) {
-		warn("Attempted to write beyond max length for MQTT Username");
-		return *this;
-	}
-
-	if(!eeprom.writeString(COOGLEIOT_MQTT_USER_ADDR, s)) {
-		error("Failed to write MQTT Username to EEPROM");
-	}
-
-	return *this;
+const char* CoogleIOT::APName() {
+  return cfgJson["ap"]["name"].as<const char*>();
 }
 
-CoogleIOT& CoogleIOT::setMQTTPassword(String s)
-{
-	if(s.length() > COOGLEIOT_MQTT_USER_PASSWORD_MAXLEN) {
-		warn("Attempted to write beyond max length for MQTT Password");
-		return *this;
-	}
-
-	if(!eeprom.writeString(COOGLEIOT_MQTT_USER_PASSWORD_ADDR, s)) {
-		error("Failed to write MQTT Password to EEPROM");
-	}
-
-	return *this;
+const char* CoogleIOT::APPassword() {
+  return cfgJson["ap"]["pass"].as<const char*>();
 }
 
-CoogleIOT& CoogleIOT::setMQTTLWTTopic(String s)
-{
-	if(s.length() > COOGLEIOT_MQTT_LWT_TOPIC_MAXLEN) {
-		warn("Attempted to write beyond max length for MQTT Last Will Topic");
-		return *this;
-	}
+// Setters
+CoogleIOT& CoogleIOT::MQTTQoS(int qos) {
+  mqttQoS = qos;
 
-	if(!eeprom.writeString(COOGLEIOT_MQTT_LWT_TOPIC_ADDR, s)) {
-		error("Failed to write MQTT Last Will Topic to EEPROM");
-	}
-	Serial.print("Setting MQTT TOPIC: ");
-	Serial.println(s);
-	return *this;
+  return *this;
 }
 
-CoogleIOT& CoogleIOT::setMQTTLWTMessage(String s)
-{
-	if(s.length() > COOGLEIOT_MQTT_LWT_MESSAGE_MAXLEN) {
-		warn("Attempted to write beyond max length for MQTT Last Will Message");
-		return *this;
-	}
+CoogleIOT& CoogleIOT::FirmwareUpdateUrl(const char* s, bool writeCfg) {
+  cfgJson["fw_upd_url"] = s;
+  if (writeCfg) writeConfig();
 
-	if(!eeprom.writeString(COOGLEIOT_MQTT_LWT_MESSAGE_ADDR, s)) {
-		error("Failed to write MQTT Last Will Message to EEPROM");
-	}
-
-	return *this;
+  return *this;
 }
 
-CoogleIOT& CoogleIOT::setRemoteAPName(String s)
-{
-	if(s.length() > COOGLEIOT_REMOTE_AP_NAME_MAXLEN) {
-		warn("Attempted to write beyond max length for Remote AP name");
-		return *this;
-	}
+CoogleIOT& CoogleIOT::MQTTClientId(const char* s, bool writeCfg) {
+  cfgJson["mqtt"]["client_id"] = s;
+  if (writeCfg) writeConfig();
 
-	if(!eeprom.writeString(COOGLEIOT_REMOTE_AP_NAME_ADDR, s)) {
-		error("Failed to write Remote AP name to EEPROM");
-	}
-
-	return *this;
+  return *this;
 }
 
-CoogleIOT& CoogleIOT::setRemoteAPPassword(String s)
-{
-	if(s.length() > COOGLEIOT_REMOTE_AP_PASSWORD_MAXLEN) {
-		warn("Attempted to write beyond max length for Remote AP Password");
-		return *this;
-	}
+CoogleIOT& CoogleIOT::MQTTHostname(const char* s, bool writeCfg) {
+  cfgJson["mqtt"]["host"] = s;
+  if (writeCfg) writeConfig();
 
-	if(!eeprom.writeString(COOGLEIOT_REMOTE_AP_PASSWORD_ADDR, s)) {
-		error("Failed to write Remote AP Password to EEPROM");
-	}
-
-	return *this;
+  return *this;
 }
 
-CoogleIOT& CoogleIOT::setAPName(String s)
-{
-	if(s.length() > COOGLEIOT_AP_NAME_MAXLEN) {
-		warn("Attempted to write beyond max length for AP Name");
-		return *this;
-	}
+CoogleIOT& CoogleIOT::MQTTPort(int port, bool writeCfg) {
+  cfgJson["mqtt"]["port"] = port;
+  if (writeCfg) writeConfig();
 
-	if(!eeprom.writeString(COOGLEIOT_AP_NAME_ADDR, s)) {
-		error("Failed to write AP Name to EEPROM");
-	}
+  return *this;
+}
 
-	return *this;
+CoogleIOT& CoogleIOT::MQTTUsername(const char* s, bool writeCfg) {
+  cfgJson["mqtt"]["user"] = s;
+  if (writeCfg) writeConfig();
+
+  return *this;
+}
+
+CoogleIOT& CoogleIOT::MQTTPassword(const char* s, bool writeCfg) {
+  cfgJson["mqtt"]["pass"] = s;
+  if (writeCfg) writeConfig();
+
+  return *this;
+}
+
+CoogleIOT& CoogleIOT::MQTTLWTTopic(const char* s, bool writeCfg) {
+  cfgJson["mqtt"]["lwt"]["topic"] = s;
+  if (writeCfg) writeConfig();
+
+  return *this;
+}
+
+CoogleIOT& CoogleIOT::MQTTLWTMessage(const char* s, bool writeCfg) {
+  cfgJson["mqtt"]["lwt"]["message"] = s;
+  if (writeCfg) writeConfig();
+
+  return *this;
+}
+
+CoogleIOT& CoogleIOT::MQTTRetain(bool b) {
+  mqttRetain = b;
+
+  return *this;
+}
+
+CoogleIOT& CoogleIOT::RemoteAPName(const char* s, bool writeCfg) {
+  cfgJson["remote_ap"]["name"] = s;
+  if (writeCfg) writeConfig();
+
+  return *this;
+}
+
+CoogleIOT& CoogleIOT::RemoteAPPassword(const char* s, bool writeCfg) {
+  cfgJson["remote_ap"]["pass"] = s;
+  if (writeCfg) writeConfig();
+
+  return *this;
+}
+
+CoogleIOT& CoogleIOT::APName(const char* s, bool writeCfg) {
+  cfgJson["ap"]["name"] = s;
+  if (writeCfg) writeConfig();
+
+  return *this;
+}
+
+CoogleIOT& CoogleIOT::APPassword(const char* s, bool writeCfg) {
+  cfgJson["ap"]["pass"] = s;
+  if (writeCfg) writeConfig();
+
+  return *this;
+}
+
+bool CoogleIOT::writeConfig() {
+  int cfgLength = measureMsgPack(cfgJsonDoc);
+  if (cfgLength > COOGLE_EEPROM_EEPROM_SIZE - sizeof(int)) {
+    logPrintf(
+        ERROR,
+        "Config data size (%d) is larger than available EEPROM space (%s)",
+        cfgLength, COOGLE_EEPROM_EEPROM_SIZE - sizeof(int));
+    return false;
+  }
+
+  std::unique_ptr<char[]> buff(new char[cfgLength]);
+  eeprom.writeInt(0, cfgLength);
+  serializeMsgPack(cfgJsonDoc, buff.get(), cfgLength);
+  eeprom.writeString(sizeof(int), buff.get(), cfgLength);
+  return true;
+}
+
+// MQTT
+CoogleIOT& CoogleIOT::MQTTSubTopic(const char* topic,
+                                   mqttSubCallback callBack = nullptr) {
+  mqttSubTopicList.emplace_back(mqttSubTopicEntry {topic, callBack});
+
+  return *this;
+}
+
+CoogleIOT& CoogleIOT::MQTTQueueMessage(const char* topic, const char* payload) {
+  return CoogleIOT::MQTTQueueMessage(topic, MQTTQoS(), MQTTRetain(), payload);
+}
+
+CoogleIOT& CoogleIOT::MQTTQueueMessage(const char* topic, uint8_t qos,
+                                       bool retain, const char* payload) {
+  mqttPublishQueue.emplace(mqttQueueEntry{topic, payload, qos, retain, 0});
+
+  return *this;
+}
+
+CoogleIOT& CoogleIOT::MQTTProcessQueue() {
+  if (!mqttPublishQueue.empty() && mqttClient.connected()) {
+		auto& head = mqttPublishQueue.front();
+    if (head.packetId == 0) {
+			auto packetId = mqttClient.publish(head.topic.c_str(), head.qos, head.retain,
+																					head.payload.c_str());
+			if (packetId) head.packetId = packetId;
+		}
+  }
+
+  return *this;
 }
 
 void CoogleIOT::checkForFirmwareUpdate()
 {
-	String firmwareUrl;
-	LUrlParser::clParseURL URL;
-	int port;
+	const char* firmwareUrl = FirmwareUpdateUrl();
 
-	firmwareUrl = getFirmwareUpdateUrl();
-
-	if(firmwareUrl.length() == 0) {
+	if(strlen(firmwareUrl) == 0) {
 		return;
 	}
 
@@ -973,13 +897,14 @@ void CoogleIOT::checkForFirmwareUpdate()
 
 	os_intr_lock();
 
-	URL = LUrlParser::clParseURL::ParseURL(firmwareUrl.c_str());
+	LUrlParser::clParseURL URL = LUrlParser::clParseURL::ParseURL(firmwareUrl);
 
 	if(!URL.IsValid()) {
 		os_intr_unlock();
 		return;
 	}
 
+	int port;
 	if(!URL.GetPort(&port)) {
 		port = 80;
 	}
@@ -989,70 +914,102 @@ void CoogleIOT::checkForFirmwareUpdate()
 	os_intr_unlock();
 }
 
-CoogleIOT& CoogleIOT::setAPPassword(String s)
-{
-	if(s.length() > COOGLEIOT_AP_PASSWORD_MAXLEN) {
-		warn("Attempted to write beyond max length for AP Password");
-		return *this;
-	}
-
-	if(!eeprom.writeString(COOGLEIOT_AP_PASSWORD_ADDR, s)) {
-		error("Failed to write AP Password to EEPROM");
-	}
-
-	return *this;
-}
-
 bool CoogleIOT::initializeMQTT()
 {
-	String mqttHostname, mqttClientId, mqttUsername, mqttPassword;
-	int mqttPort;
-
 	flashStatus(COOGLEIOT_STATUS_MQTT_INIT);
 
-	mqttHostname = getMQTTHostname();
-
-	if(mqttHostname.length() == 0) {
+	if(strlen(MQTTHostname()) == 0) {
 		info("No MQTT Hostname specified. Cannot Initialize MQTT");
 		mqttClientActive = false;
 		return false;
 	}
 
-	mqttClientId = getMQTTClientId();
-
-	if(mqttClientId.length() == 0) {
-		info("Setting to default MQTT Client ID: " COOGLEIOT_DEFAULT_MQTT_CLIENT_ID);
-
-		mqttClientId = COOGLEIOT_DEFAULT_MQTT_CLIENT_ID;
-
-		setMQTTClientId(mqttClientId);
-	}
-
-	mqttPort = getMQTTPort();
-
-	if(mqttPort == 0) {
+	if(MQTTPort() == 0) {
 		info("Setting to default MQTT Port");
-		setMQTTPort(COOGLEIOT_DEFAULT_MQTT_PORT);
+		MQTTPort(COOGLEIOT_DEFAULT_MQTT_PORT);
 	}
 
-	mqttClient = new PubSubClient(espClient);
-	mqttClient->setServer(mqttHostname.c_str(), mqttPort);
+	if (strlen(MQTTClientId()) == 0) {
+		info(
+				"Setting to default MQTT Client "
+				"ID: " COOGLEIOT_DEFAULT_MQTT_CLIENT_ID);
 
-	return connectToMQTT();
+		MQTTClientId(COOGLEIOT_DEFAULT_MQTT_CLIENT_ID);
+	}
+
+	mqttClient.setClientId(MQTTClientId())
+						.setCredentials(MQTTUsername(), MQTTPassword())
+						.setServer(MQTTHostname(), MQTTPort());
+
+	if(strlen(MQTTLWTTopic()) != 0)
+		mqttClient.setWill(MQTTLWTTopic(), mqttQoS, mqttRetain,
+												MQTTLWTMessage());
+
+	mqttClient.onConnect([=](bool sessionPresent) {
+    logPrintf(INFO, "Connected to MQTT broker: %s", MQTTHostname());
+    for (const auto& s : mqttSubTopicList) {
+			mqttClient.subscribe(s.topic.c_str(), mqttQoS);
+			logPrintf(INFO, "Subscribed to Topic: %s", s.topic.c_str());
+		}
+  });
+
+	mqttClient.onPublish([=](uint16_t packetId) {
+		if (mqttPublishQueue.front().packetId == packetId) mqttPublishQueue.pop();
+	});
+
+	mqttClient.onMessage([=](char* topic, char* payloadIn, 
+														AsyncMqttClientMessageProperties properties,
+                            size_t len, size_t index, size_t total) {
+		auto subMatch = [](const std::string sub, const std::string topic) -> bool {
+				auto splitStr = [](std::string str, const char delim) -> std::vector<std::string> {
+						std::vector<std::string> v;
+						std::string tmp;
+						for(auto i = str.begin(); i <= str.end(); ++i)
+								if(*i != delim && i != str.end()) tmp += *i;
+								else {
+										v.emplace_back(tmp);
+										tmp = ""; 
+								}   
+						return v;
+				};				
+				auto subTok = splitStr(sub,'/');
+				auto topicTok = splitStr(topic,'/');				
+				for (int t = 0; t < subTok.size(); t++) {
+						if (subTok[t] == topicTok[t] || subTok[t] == "+") continue;
+						if (subTok[t] == "#" && t == subTok.size() - 1) return true;
+						return false;
+				}
+				return subTok.size() == topicTok.size();;
+		};
+
+		static std::string payload;
+		static std::vector<bool> pMap;
+
+		if(len != total) {
+			payload.insert(0,total,' ');
+			std::fill_n(std::back_inserter(pMap), total, false);
+			payload.insert(index,payloadIn,len);
+			std::fill_n(pMap.begin()+index, len, true);
+			if (!std::all_of(pMap.begin(), pMap.end(), [](bool v) { return v; })) return;
+		} else
+			payload.assign(payloadIn,len);
+
+		for (const auto& subT : mqttSubTopicList)
+			if (subT.callBack != nullptr && subMatch(subT.topic,topic))
+				subT.callBack(topic,payload.c_str(),properties);
+
+		payload.clear(); pMap.clear();
+		payload.shrink_to_fit(); pMap.shrink_to_fit();
+	});
+
+  return connectToMQTT();
 }
 
-PubSubClient* CoogleIOT::getMQTTClient()
-{
-	return mqttClient;
-}
+AsyncMqttClient* CoogleIOT::getMQTTClient() { return &mqttClient; }
 
 bool CoogleIOT::connectToMQTT()
 {
-	bool connectResult;
-	String mqttHostname, mqttUsername, mqttPassword, mqttClientId, mqttLWTTopic, mqttLWTMessage;
-	int mqttPort;
-
-	if(mqttClient->connected()) {
+	if(mqttClient.connected()) {
 		mqttClientActive = true;
 		return true;
 	}
@@ -1063,186 +1020,67 @@ bool CoogleIOT::connectToMQTT()
 		return false;
 	}
 
-	mqttHostname = getMQTTHostname();
-	mqttUsername = getMQTTUsername();
-	mqttPassword = getMQTTPassword();
-	mqttPort = getMQTTPort();
-	mqttClientId = getMQTTClientId();
-	mqttLWTTopic = getMQTTLWTTopic();
-	mqttLWTMessage = getMQTTLWTMessage();
-
-	if(mqttHostname.length() == 0) {
+	if(strlen(MQTTHostname()) == 0) {
 		mqttClientActive = false;
 		return false;
 	}
 
 	info("Attempting to Connect to MQTT Server");
 
-	mqttClient->setServer(mqttHostname.c_str(), mqttPort);
+	mqttClient.connect();
+  delay(2000);
 
-	logPrintf(DEBUG, "Host: %s : %d", mqttHostname.c_str(), mqttPort);
+  logPrintf(DEBUG, "Host: %s : %d",MQTTHostname(), MQTTPort());
 
-	if(mqttUsername.length() == 0) {
-		if(mqttLWTTopic.length() == 0) {
-			connectResult = mqttClient->connect(mqttClientId.c_str());
-		} else {
-			connectResult = mqttClient->connect(mqttClientId.c_str(), mqttLWTTopic.c_str(), 0, true, mqttLWTMessage.c_str());
-		}
-	} else {
-		if(mqttLWTTopic.length() == 0) {
-			connectResult = mqttClient->connect(mqttClientId.c_str(), mqttUsername.c_str(), mqttPassword.c_str());
-		} else {
-			connectResult = mqttClient->connect(mqttClientId.c_str(), mqttUsername.c_str(), mqttPassword.c_str(), mqttLWTTopic.c_str(), 0, true, mqttLWTMessage.c_str());
-		}
-	}
-
-	if(!mqttClient->connected()) {
-
-		switch(mqttClient->state()) {
-
-			case MQTT_CONNECTION_TIMEOUT:
-				error("MQTT Failure: Connection Timeout (server didn't respond within keepalive time)");
-				break;
-			case MQTT_CONNECTION_LOST:
-				error("MQTT Failure: Connection Lost (the network connection was broken)");
-				break;
-			case MQTT_CONNECT_FAILED:
-				error("MQTT Failure: Connection Failed (the network connection failed)");
-				break;
-			case MQTT_DISCONNECTED:
-				error("MQTT Failure: Disconnected (the client is disconnected)");
-				break;
-			case MQTT_CONNECTED:
-				error("MQTT reported as not connected, but state says it is!");
-				break;
-			case MQTT_CONNECT_BAD_PROTOCOL:
-				error("MQTT Failure: Bad Protocol (the server doesn't support the requested version of MQTT)");
-				break;
-			case MQTT_CONNECT_BAD_CLIENT_ID:
-				error("MQTT Failure: Bad Client ID (the server rejected the client identifier)");
-				break;
-			case MQTT_CONNECT_UNAVAILABLE:
-				error("MQTT Failure: Unavailable (the server was unable to accept the connection)");
-				break;
-			case MQTT_CONNECT_BAD_CREDENTIALS:
-				error("MQTT Failure: Bad Credentials (the username/password were rejected)");
-				break;
-			case MQTT_CONNECT_UNAUTHORIZED:
-				error("MQTT Failure: Unauthorized (the client was not authorized to connect)");
-				break;
-			default:
-				error("MQTT Failure: Unknown Error");
-				break;
-		}
-
+	if(!mqttClient.connected()) {
 		error("Failed to connect to MQTT Server!");
 		mqttClientActive = false;
 		return false;
 	}
 
 	info("MQTT Client Initialized");
-
 	mqttClientActive = true;
-
 	return true;
-}
-
-String CoogleIOT::getAPName()
-{
-	char APName[COOGLEIOT_AP_NAME_MAXLEN];
-
-	if(!eeprom.readString(COOGLEIOT_AP_NAME_ADDR, APName, COOGLEIOT_AP_NAME_MAXLEN)) {
-		error("Failed to read AP name from EEPROM");
-	}
-
-	String retval(APName);
-	return filterAscii(retval);
-}
-
-String CoogleIOT::getAPPassword()
-{
-	char password[COOGLEIOT_AP_PASSWORD_MAXLEN];
-
-	if(!eeprom.readString(COOGLEIOT_AP_PASSWORD_ADDR, password, COOGLEIOT_AP_PASSWORD_MAXLEN)) {
-		error("Failed to read AP Password from EEPROM");
-	}
-
-	String retval(password);
-	return filterAscii(retval);
-}
-
-String CoogleIOT::filterAscii(String s)
-{
-	String retval;
-
-	for(int i = 0; i < s.length(); i++) {
-
-		if(isascii(s.charAt(i))) {
-			retval += s.charAt(i);
-		}
-	}
-
-	return retval;
-}
-
-String CoogleIOT::getRemoteAPName()
-{
-	char remoteAPName[COOGLEIOT_AP_NAME_MAXLEN];
-
-	if(!eeprom.readString(COOGLEIOT_REMOTE_AP_NAME_ADDR, remoteAPName, COOGLEIOT_REMOTE_AP_NAME_MAXLEN)) {
-		error("Failed to read Remote AP Name from EEPROM");
-		remoteAPName[0] = 0;
-	}
-
-	String retval(remoteAPName);
-
-	return filterAscii(retval);
-}
-
-String CoogleIOT::getRemoteAPPassword()
-{
-	char remoteAPPassword[COOGLEIOT_REMOTE_AP_PASSWORD_MAXLEN];
-
-	if(!eeprom.readString(COOGLEIOT_REMOTE_AP_PASSWORD_ADDR, remoteAPPassword, COOGLEIOT_REMOTE_AP_PASSWORD_MAXLEN)) {
-		error("Failed to read remote AP Password from EEPROM");
-	}
-
-	String retval(remoteAPPassword);
-	return filterAscii(retval);
 }
 
 bool CoogleIOT::connectToSSID()
 {
-	String remoteAPName;
-	String remoteAPPassword;
-	String localAPName;
-
 	flashStatus(COOGLEIOT_STATUS_WIFI_INIT);
 
-	remoteAPName = getRemoteAPName();
-	remoteAPPassword = getRemoteAPPassword();
-
-	if(remoteAPName.length() == 0) {
+	if(strlen(RemoteAPName()) == 0) {
 		info("Cannot connect WiFi client, no remote AP specified");
 		return false;
 	}
 
 	info("Connecting to remote AP");
 
-	if(remoteAPPassword.length() == 0) {
+	if(strlen(RemoteAPPassword()) == 0) {
 		warn("No Remote AP Password Specified!");
-
-		WiFi.begin(remoteAPName.c_str(), NULL, 0, NULL, true);
-
+  	wifiMulti.addAP(RemoteAPName(), NULL);
 	} else {
-
-		WiFi.begin(remoteAPName.c_str(), remoteAPPassword.c_str(), 0, NULL, true);
-
+		wifiMulti.addAP(RemoteAPName(), RemoteAPPassword());
 	}
 
-	for(int i = 0; (i < 50) && (WiFi.status() != WL_CONNECTED) && (WiFi.status() != WL_CONNECT_FAILED); i++) {
-		delay(500);
-	}
+  int waitLoop = 50;
+  while (int wifiStatus = wifiMulti.run() != WL_CONNECTED && waitLoop) {
+    if (wifiStatus == WL_CONNECT_FAILED) {
+      error("Invalid secret");
+			break;
+    }
+    switch (wifiStatus) {
+      case WL_IDLE_STATUS:    info("Status: Wi-Fi is in process of changing between statuses");
+                              break;
+      case WL_NO_SSID_AVAIL:  info("Status: configured SSID cannot be reached");
+                              break;
+      case WL_CONNECTED:      info("Status: successful connection is established");
+                              break;
+      case WL_DISCONNECTED:   info("Status: module is not configured in station mode");
+                              break;
+      default: break;
+    }
+    delay(500);
+    waitLoop--;
+  }
 
 	if(WiFi.status() != WL_CONNECTED) {
 		error("Could not connect to Access Point!");

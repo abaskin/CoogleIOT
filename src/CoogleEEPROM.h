@@ -42,9 +42,8 @@ class CoogleEEProm
 		bool readInt(int, int *);
 		bool writeString(int address, String str);
 		bool writeString(int, const char *);
+    bool writeString(int, const char *, int);
 		bool readString(int, char *, int);
-		bool isApp(const byte *);
-		bool setApp(const byte *);
 };
 
 #endif

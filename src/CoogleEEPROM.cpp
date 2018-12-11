@@ -53,42 +53,15 @@ void CoogleEEProm::fill(int startAddress, int endAddress, byte b)
 	EEPROM.commit();
 }
 
-bool CoogleEEProm::setApp(const byte *magic)
-{
-	return writeBytes(0, magic, 4);
-}
-
-bool CoogleEEProm::isApp(const byte *magic)
-{
-	byte bytes[4];
-	
-	readBytes(0, bytes, 4);
-	
-	for(int i = 0; i < 4; i++) {
-		if(bytes[i] != magic[i]) {
-
-#ifdef COOGLEEEPROM_DEBUG
-			Serial.println("[COOGLE-EEPROM] Failed to locate magic bytes to identify memory");
-#endif
-			return false;
-		}
-	}
-	
-	return true;
-}
-
 void CoogleEEProm::dump(int bytesPerRow = 16)
-{
-	int curAddr, curRow;
-	byte b;
-	
+{	
 	char buf[10];
 	
 	if(!Serial) {
 		return;
 	}
 	
-	curRow = 0;
+	int curRow = 0;
 	
 	for(int i = 0; i <= COOGLE_EEPROM_EEPROM_SIZE; i++) {
 		
@@ -97,7 +70,7 @@ void CoogleEEProm::dump(int bytesPerRow = 16)
 			Serial.print(buf);
 		}
 		
-		b = EEPROM.read(i);
+		byte b = EEPROM.read(i);
 		
 		sprintf(buf, "%02X", b);
 		
@@ -175,11 +148,7 @@ bool CoogleEEProm::readBytes(int startAddress, byte array[], int length)
 
 bool CoogleEEProm::writeInt(int address, int value)
 {
-	byte *ptr;
-	
-	ptr = (byte *)&value;
-	
-	return writeBytes(address, ptr, sizeof(value));
+	return writeBytes(address, (byte *)&value, sizeof(value));
 }
 
 bool CoogleEEProm::readInt(int address, int *value)
@@ -189,37 +158,25 @@ bool CoogleEEProm::readInt(int address, int *value)
 
 bool CoogleEEProm::writeString(int address, String str)
 {
-	char *data;
-	bool retval;
-
-	data = (char *)malloc(str.length() + 1);
-	str.toCharArray(data, str.length() + 1);
-
-	retval = writeString(address, data);
-
 #ifdef COOGLEEEPROM_DEBUG
-	Serial.print("[COOGLE-EEPROM] Wrote String: ");
-	Serial.println(data);
+        Serial.print("[COOGLE-EEPROM] Writing String: ");
+        Serial.println(str);
 #endif
 
-	free(data);
-
-	return retval;
-
+  return writeString(address, str.c_str());
 }
+
 bool CoogleEEProm::writeString(int address, const char *string)
 {
-	int length;
-	
-	length = strlen(string) + 1;
-	
-	return writeBytes(address, (const byte *)string, length);
+	return writeBytes(address, (const byte *)string, strlen(string) + 1);
+}
+
+bool CoogleEEProm::writeString(int address, const char *string, int len) {
+  return writeBytes(address, (const byte *)string, len);
 }
 
 bool CoogleEEProm::readString(int startAddress, char *buffer, int bufSize)
 {
-	int bufIdx;
-	
 #ifdef COOGLEEEPROM_DEBUG
 	Serial.print("Reading into Buffer that is ");
 	Serial.print(bufSize);
@@ -254,7 +211,7 @@ bool CoogleEEProm::readString(int startAddress, char *buffer, int bufSize)
 		return true;
 	}
 	
-	bufIdx = 0;
+	int bufIdx = 0;
 
 #ifdef COOGLEEEPROM_DEBUG
 	Serial.print("[COOGLE-EEPROM] Read Chars: ");

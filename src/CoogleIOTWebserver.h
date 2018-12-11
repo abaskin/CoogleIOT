@@ -23,13 +23,14 @@
 #ifndef COOGLEIOT_WEBSERVER_H
 #define COOGLEIOT_WEBSERVER_H
 
-#include <ESP8266mDNS.h>
 #include <ESP8266WebServer.h>
-#include "ArduinoJson.h"
-#include "WiFiClientPrint.h"
+#include <ESP8266mDNS.h>
 #include "CoogleIOT.h"
-#include "DNSServer/DNSServer.h"
 #include "CoogleIOTConfig.h"
+#include "DNSServer/DNSServer.h"
+#include "WiFiClientPrint.h"
+
+#include <ArduinoJson.h>  //https://github.com/bblanchon/ArduinoJson
 
 #include "webpages/home.h"
 #include "webpages/mini_css_default.h"
@@ -49,8 +50,8 @@ class CoogleIOTWebserver
 		CoogleIOTWebserver& setWebserver(ESP8266WebServer* server);
 		CoogleIOTWebserver& setServerPort(int port);
 
-		String htmlEncode(String&);
-		String htmlEncode(char *);
+		String htmlEncode(String);
+		String htmlEncode(const char *);
 
 		bool initialize();
 		void handleRoot();
