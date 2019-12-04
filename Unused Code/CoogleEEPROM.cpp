@@ -26,9 +26,9 @@ void CoogleEEProm::initialize(size_t size)
 {
 
 #ifdef COOGLEEEPROM_DEBUG
-	Serial.print("Initializing EEPROM to ");
+	Serial.print(F("Initializing EEPROM to "));
 	Serial.print(size);
-	Serial.println(" bytes");
+	Serial.println(F(" bytes"));
 #endif
 
 	EEPROM.begin(size);
@@ -87,15 +87,13 @@ void CoogleEEProm::dump(int bytesPerRow = 16)
 
 bool CoogleEEProm::validAddress(int address)
 {
-	if(address <= COOGLE_EEPROM_EEPROM_SIZE) {
-		return true;
-	}
-
 #ifdef COOGLEEEPROM_DEBUG
-	Serial.printf("[COOGLE-EEPROM] Invalid Address: %d of %d\n", address, COOGLE_EEPROM_EEPROM_SIZE);
+  Serial.printf(F("[COOGLE-EEPROM] %s Address: %d of %d\n"),
+                (address <= COOGLE_EEPROM_EEPROM_SIZE) ? "Valid" : "Invalid",
+								address, COOGLE_EEPROM_EEPROM_SIZE);
 #endif
 
-	return (address <= COOGLE_EEPROM_EEPROM_SIZE);
+	return address <= COOGLE_EEPROM_EEPROM_SIZE;
 }
 
 bool CoogleEEProm::writeBytes(int startAddress, const byte *array, int length)
@@ -105,7 +103,7 @@ bool CoogleEEProm::writeBytes(int startAddress, const byte *array, int length)
 	}
 
 #ifdef COOGLEEEPROM_DEBUG
-	Serial.print("Writing Bytes: ");
+	Serial.print(F("Writing Bytes: "));
 #endif
 	
 	for(int i = 0; i < length; i++) {
@@ -124,9 +122,9 @@ bool CoogleEEProm::writeBytes(int startAddress, const byte *array, int length)
 	EEPROM.commit();
 
 #ifdef COOGLEEEPROM_DEBUG
-	Serial.print("[COOGLE-EEPROM] Wrote ");
+	Serial.print(F("[COOGLE-EEPROM] Wrote "));
 	Serial.print(length);
-	Serial.print(" bytes to address ");
+	Serial.print(F(" bytes to address "));
 	Serial.println(startAddress);
 #endif
 	
@@ -159,7 +157,7 @@ bool CoogleEEProm::readInt(int address, int *value)
 bool CoogleEEProm::writeString(int address, String str)
 {
 #ifdef COOGLEEEPROM_DEBUG
-        Serial.print("[COOGLE-EEPROM] Writing String: ");
+        Serial.print(F("[COOGLE-EEPROM] Writing String: "));
         Serial.println(str);
 #endif
 
@@ -178,9 +176,9 @@ bool CoogleEEProm::writeString(int address, const char *string, int len) {
 bool CoogleEEProm::readString(int startAddress, char *buffer, int bufSize)
 {
 #ifdef COOGLEEEPROM_DEBUG
-	Serial.print("Reading into Buffer that is ");
+	Serial.print(F("Reading into Buffer that is "));
 	Serial.print(bufSize);
-	Serial.print(" byte(s) from ");
+	Serial.print(F(" byte(s) from "));
 	Serial.println(startAddress);
 
 #endif
@@ -188,7 +186,7 @@ bool CoogleEEProm::readString(int startAddress, char *buffer, int bufSize)
 	if(!validAddress(startAddress)) {
 
 #ifdef COOGLEEPROM_DEBUG
-		Serial.println("Failed to read from address, invalid address!");
+		Serial.println(F("Failed to read from address, invalid address!"));
 #endif
 
 		return false;
@@ -196,7 +194,7 @@ bool CoogleEEProm::readString(int startAddress, char *buffer, int bufSize)
 	
 	if(bufSize == 0) {
 #ifdef COOGLEEEPROM_DEBUG
-		Serial.println("Read buffer size was zero, returning false");
+		Serial.println(F("Read buffer size was zero, returning false"));
 #endif
 		return false;
 	}
@@ -204,7 +202,7 @@ bool CoogleEEProm::readString(int startAddress, char *buffer, int bufSize)
 	if(bufSize == 1) {
 
 #ifdef COOGLEEEPROM_DEBUG
-		Serial.println("Buffer Size was 1, returning null");
+		Serial.println(F("Buffer Size was 1, returning null"));
 #endif
 
 		buffer[0] = '\0';
@@ -214,7 +212,7 @@ bool CoogleEEProm::readString(int startAddress, char *buffer, int bufSize)
 	int bufIdx = 0;
 
 #ifdef COOGLEEEPROM_DEBUG
-	Serial.print("[COOGLE-EEPROM] Read Chars: ");
+	Serial.print(F("[COOGLE-EEPROM] Read Chars: "));
 #endif
 
 	do {
@@ -237,11 +235,11 @@ bool CoogleEEProm::readString(int startAddress, char *buffer, int bufSize)
 	Serial.println();
 
 	if(buffer[bufIdx - 1] == 0x00) {
-		Serial.println("Read stopped due to NULL");
+		Serial.println(F("Read stopped due to NULL"));
 	} else if(bufIdx >= bufSize) {
-		Serial.println("Read stopped due to hitting buffer limit");
+		Serial.println(F("Read stopped due to hitting buffer limit"));
 	} else if((startAddress + bufIdx) > COOGLE_EEPROM_EEPROM_SIZE) {
-		Serial.println("Read stopped due to hitting max EEPROM size limit");
+		Serial.println(F("Read stopped due to hitting max EEPROM size limit"));
 	}
 #endif
 
@@ -250,7 +248,7 @@ bool CoogleEEProm::readString(int startAddress, char *buffer, int bufSize)
 	}
 	
 #ifdef COOGLEEEPROM_DEBUG
-	Serial.print("Read String: ");
+	Serial.print(F("Read String: "));
 	Serial.println(buffer);
 #endif
 

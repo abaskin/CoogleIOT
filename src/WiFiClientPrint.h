@@ -32,6 +32,7 @@ class WiFiClientPrint : public Print
       if (_length == BUFFER_SIZE) {
         flush();
       }
+      return _length;
     }
 
     void flush()

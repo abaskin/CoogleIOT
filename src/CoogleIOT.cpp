@@ -23,27 +23,41 @@
 #include "CoogleIOT.h"
 #include "CoogleIOTConfig.h"
 
-CoogleIOT* __coogle_iot_self;
-
-extern "C" void __coogle_iot_firmware_timer_callback(void *pArg)
-{
-	__coogle_iot_self->firmwareUpdateTick = true;
-}
-
-extern "C" void __coogle_iot_heartbeat_timer_callback(void *pArg)
-{
-	__coogle_iot_self->heartbeatTick = true;
-}
-
-extern "C" void __coogle_iot_sketch_timer_callback(void *pArg)
-{
-	__coogle_iot_self->sketchTimerTick = true;
-}
-
-CoogleIOT::CoogleIOT(int statusPin)
+CoogleIOT::CoogleIOT(uint8_t statusPin)
 {
     _statusPin = statusPin;
     _serial = false;
+
+    settimeofday_cb([this](){
+      _timeSet = true;
+      notice(F("Time set to %s"), timeStampISO8601());
+    });
+
+    WiFi.onStationModeConnected(
+        [=](const WiFiEventStationModeConnected& event) {
+          notice(F("Station connected, SSID: %s, BSSID: "
+                   "%2X:%2X:%2X:%2X:%2X:%2X, Channel: %d"),
+                 event.ssid.c_str(), event.bssid[0], event.bssid[1],
+                 event.bssid[2], event.bssid[3], event.bssid[4], event.bssid[5],
+                 event.channel);
+        });
+
+    WiFi.onStationModeDisconnected(
+        [=](const WiFiEventStationModeDisconnected& event) {
+          notice(F("Station disconnected, SSID: %s, BSSID: "
+                   "%2X:%2X:%2X:%2X:%2X:%2X, Reason: %d"),
+                 event.ssid.c_str(), event.bssid[0], event.bssid[1],
+                 event.bssid[2], event.bssid[3], event.bssid[4], event.bssid[5],
+                 event.reason);
+        });
+
+    WiFi.onStationModeGotIP([this](const WiFiEventStationModeGotIP& event) {
+      notice(F("Station IP: %s, Netmask: %s, Gateway: %s"),
+             event.ip.toString().c_str(), event.mask.toString().c_str(),
+             event.gw.toString().c_str());
+      _wifiConnectTime = 0;
+      connectToMQTT();
+    });
 }
 
 CoogleIOT::CoogleIOT()
@@ -53,8 +67,6 @@ CoogleIOT::CoogleIOT()
 
 CoogleIOT::~CoogleIOT()
 {
-	delete webServer;
-
 	if(logFile) {
 		logFile.close();
 	}
@@ -63,137 +75,343 @@ CoogleIOT::~CoogleIOT()
 	Serial.end();
 
 	if(_firmwareClientActive) {
-		os_timer_disarm(&firmwareUpdateTimer);
+		firmwareUpdateTimer.detach();
 	}
 
-	if(sketchTimerInterval > 0) {
-		os_timer_disarm(&sketchTimer);
-	}
+	heartbeatTimer.detach();
+}
 
-	os_timer_disarm(&heartbeatTimer);
+// Initialize
+bool CoogleIOT::initialize() {
+  if (_statusPin > -1) {
+    pinMode(_statusPin, OUTPUT);
+    flashStatus(COOGLEIOT_STATUS_INIT);
+  }
+
+  info(F("Coogle IOT v%s initializing.."), COOGLEIOT_VERSION);
+
+  verifyFlashConfiguration();
+
+  randomSeed(micros());
+
+  EEPROM.begin(COOGLE_EEPROM_SIZE);
+
+  SPIFFS.begin();
+
+  size_t cfgSize;
+  EEPROM.get(0, cfgSize);
+
+  DeserializationError err = DeserializationError::InvalidInput;
+  if (cfgSize && cfgSize <= cfgDataSize) {
+    char buff[cfgDataSize];
+    EEPROM.get(sizeof(cfgSize), buff);
+    #if COOGLEIOT_USE_MSGPACK
+    err = deserializeMsgPack(cfgJson, buff, cfgSize);
+    #else
+    err = deserializeJson(cfgJson, buff, cfgSize);
+    #endif
+  }
+
+  if (err) {
+    info(F("EEPROM not initialized for platform, initialzing..."));
+
+    deserializeJson(cfgJson, 
+      F(R"({                                             )"
+        R"( "ap" : { "name" : "", "pass" : "" },         )"
+        R"( "remote_ap" : { "name" : "", "pass" : "" },  )"
+        R"( "mqtt" : {                                   )"
+        R"(   "host" : "",                               )"
+        R"(   "user" : "",                               )"
+        R"(   "pass" : "",                               )"
+        R"(   "client_id" : "",                          )"
+        R"(   "port" : 0,                                )"
+        R"(   "lwt" : { "topic" : "", "message" : "" }   )"
+        R"( },                                           )"
+        R"( "fw_upd_url" : ""                            )"
+        R"(}                                             )")
+    );
+
+    writeConfig();
+  }
+
+  if (!(logFile = SPIFFS.open(COOGLEIOT_SPIFFS_LOGFILE, "a+"))) {
+    error(F("Could not open SPIFFS log file!"));
+  } else {
+    info(F("Log file successfully opened"));
+  }
+
+  if (strlen(APName()) > 0) {
+    WiFi.hostname(APName());
+  }
+
+  initializeMQTT();
+
+  connectToSSID();
+
+  timeZone("UTC0");
+
+  enableConfigurationMode();
+
+  if (strlen(FirmwareUpdateUrl()) > 0) {
+    firmwareUpdateTimer.attach(COOGLEIOT_FIRMWARE_UPDATE_CHECK, [this]() {
+      if (strlen(FirmwareUpdateUrl()) == 0) return;
+      if (wifiMulti.run() != WL_CONNECTED) return;
+
+      info(F("Checking for Firmware Updates"));
+
+      LUrlParser::clParseURL URL =
+          LUrlParser::clParseURL::ParseURL(FirmwareUpdateUrl());
+
+      if (!URL.IsValid()) return;
+
+      int port;
+      if (!URL.GetPort(&port)) {
+        port = 80;
+      }
+
+      os_intr_lock();
+
+        WiFiClient client;
+        auto firmwareUpdateStatus = ESPhttpUpdate.update(client,
+                                                         URL.m_Host.c_str(),
+                                                         port,
+                                                         URL.m_Path.c_str(),
+                                                         COOGLEIOT_VERSION);
+
+      os_intr_unlock();
+
+      if (_serial) {
+        switch (firmwareUpdateStatus) {
+          case HTTP_UPDATE_FAILED:
+            warn(F("Warning! Failed to update firmware with specified URL"));
+            break;
+          case HTTP_UPDATE_NO_UPDATES:
+            info(F("Firmware update check completed - at current version"));
+            break;
+          case HTTP_UPDATE_OK:
+            info(F("Firmware Updated!"));
+            break;
+          default:
+            warn(F("Warning! No updated performed. Perhaps an invalid URL?"));
+            break;
+        }
+      }
+    });
+
+    info(F("Automatic Firmware Update Enabled"));
+
+    _firmwareClientActive = true;
+  }
+
+  heartbeatTimer.attach(COOGLEIOT_HEARTBEAT, [this]() {
+    flashStatus(100, 1);
+    yield();
+
+    if (_wifiConnectTime &&
+        _wifiConnectTime - millis() > COOGLEIOT_MAX_WIFI_CONNECT_TIME &&
+        WiFi.status() != WL_CONNECTED) {
+      info(
+          F("Failed to long to establish a WiFi connection. Restarting "
+            "Device."));
+      restartDevice();
+      return;
+    }
+
+    const char* format =
+        PSTR(R"({ "timestamp" : "%s", "ip" : "%s", )"
+             R"("coogleiot_version" : "%s", "client_id" : "%s" })");
+    std::unique_ptr<char[]> json(
+        new char[strlen_P(format) + strlen(timeStampISO8601()) +
+                 WiFi.localIP().toString().length() +
+                 strlen(COOGLEIOT_VERSION) + strlen(MQTTClientId()) + 1]);
+    sprintf_P(json.get(), format, timeStampISO8601(),
+              WiFi.localIP().toString().c_str(), COOGLEIOT_VERSION,
+              MQTTClientId());
+
+    std::unique_ptr<char[]> topic(
+        new char[strlen(COOGLEIOT_DEVICE_TOPIC) + strlen(MQTTClientId()) + 2]);
+    sprintf_P(topic.get(), PSTR("%s/%s"), COOGLEIOT_DEVICE_TOPIC,
+              MQTTClientId());
+
+    MQTTQueueMessage(std::move(topic), std::move(json));
+  });
+
+  schedule_function(std::bind(&CoogleIOT::loop, this));
+
+  return true;
+}
+
+// Loop
+void CoogleIOT::loop() {
+  if (wifiMulti.run() != WL_CONNECTED) {
+    if (strlen(SSIDName()) > 0) {
+      if (!_wifiConnectTime) {
+        _wifiConnectTime = millis();
+        info(F("Not connected to WiFi. Attempting reconnection."));
+        info(F("Will attempt for %s seconds before restarting."),
+             COOGLEIOT_MAX_WIFI_CONNECT_TIME);
+      }
+      return;
+    }
+  } else {
+    connectToMQTT();
+    MQTTProcessQueue();
+  }
+
+  yield();
+  if (webServer) webServer->loop();
+
+  yield();
+	#ifndef ARDUINO_ESP8266_ESP01
+		if (_dnsServerActive) {
+			dnsServer.processNextRequest();
+		}
+	#endif
+
+	for(auto const& l : loopFunctions) if (!l.second()) loopRemove(l.first);
+}
+
+bool CoogleIOT::loopAdd(const char* name, loopFunction_t newFunction) {
+  loopFunctions[name] = newFunction;
+	return true;
+}
+
+bool CoogleIOT::loopRemove(const char* name) {
+  auto search = loopFunctions.find(name);
+  if (search != loopFunctions.end()) {
+    loopFunctions.erase(search);
+    return true;
+	}
+	return false;
 }
 
 // Time
-CoogleIOT& CoogleIOT::registerTimer(int interval, sketchtimer_cb_t callback)
-{
-	if(interval <= 0) {
-		if(sketchTimerInterval > 0) {
-			os_timer_disarm(&sketchTimer);
-		}
-
-		sketchTimerCallback = NULL;
-		sketchTimerInterval = 0;
-
-		return *this;
-	}
-
-	sketchTimerCallback = callback;
-	sketchTimerInterval = interval;
-
-	os_timer_setfn(&sketchTimer, __coogle_iot_sketch_timer_callback, NULL);
-	os_timer_arm(&sketchTimer, sketchTimerInterval, true);
-
-	return *this;
+char* CoogleIOT::timeStampISO8601() const {
+  timeval tv;
+  gettimeofday(&tv, nullptr);
+  return timeStampISO8601(tv);
 }
 
-String CoogleIOT::TimestampAsString()
-{
-	String timestamp;
-	struct tm* p_tm;
+char* CoogleIOT::timeStampISO8601(timeval& tv) const {
+  char buffer[32];  // 2019-11-30T09:57:32.504072+0700
+  strftime(buffer, sizeof(buffer), "%FT%T.%%d%z", localtime(&tv.tv_sec));
+  char timeStr[32];
+  sprintf(timeStr, buffer, tv.tv_usec);
+  return std::move(timeStr);
+}
 
-	if(now) {
-		p_tm = localtime(&now);
+char* CoogleIOT::dateISO8601(time_t t) const {
+  char buffer[12];  // 2019-11-30
+  strftime(buffer, sizeof(buffer), "%F", localtime(&t));
+  return std::move(buffer);
+}
 
-		timestamp = timestamp +
-					(p_tm->tm_year + 1900) + "-" +
-					(p_tm->tm_mon < 10 ? "0" : "") + p_tm->tm_mon + "-" +
-					(p_tm->tm_mday < 10 ? "0" : "") + p_tm->tm_mday + " " +
-					(p_tm->tm_hour < 10 ? "0" : "") + p_tm->tm_hour + ":" +
-					(p_tm->tm_min < 10 ? "0" : "") + p_tm->tm_min + ":" +
-					(p_tm->tm_sec < 10 ? "0" : "") + p_tm->tm_sec;
-	} else {
-		timestamp = F("UKWN");
-	}
+void CoogleIOT::timeZone(const char* tzName) {
+  char tzStr[80];
+  for (auto const& tz : tzData) {
+    strcpy_P(tzStr, tz);
+    if (!strchr(tzStr, ':')) continue;
+    auto tzSpec = strchr(tzStr, ':') + 1;
+    *(strchr(tzStr, ':')) = '\0';
+    if (!strcmp(tzName, tzStr)) {
+      _timeSet = false;
+      configTime(tzSpec, "pool.ntp.org");
+      using esp8266::polledTimeout::oneShotMs;  // import the type to the local
+                                                // namespace
+      oneShotMs sntpWait(10 * 1000);
+      while (!sntpWait) {
+        yield();
+        if (_timeSet) {
+          notice(F("Timezone set to %s"), tzName);
+          return;
+        }
+      }  
+      notice(F("Unable to set timezone to %s"), tzName);
+      return;
+    }
+  }
+  error(F("Timezone not found: %s"), tzName);
+}
 
-	return timestamp;
+float CoogleIOT::tzOffset() const {
+  if (!_timeSet) return 0.0;
+
+  timeval tv;
+  gettimeofday(&tv, nullptr);
+  char buffer[6]; // +0700
+  strftime(buffer, sizeof(buffer), "%z", localtime(&tv.tv_sec));
+  auto offset = atoi(buffer);
+  auto result = offset / 100 + (offset - offset / 100 * 100) / 60.0;
+  return (isDST(tv.tv_sec)) ? result - 1.0 : result;
+}
+
+bool CoogleIOT::isDST() const {
+  timeval tv;
+  gettimeofday(&tv, nullptr);
+  return isDST(tv.tv_sec);
+}
+
+bool CoogleIOT::isDST(time_t currTime) const {
+  return localtime(&currTime)->tm_isdst > 0;
+}
+
+bool CoogleIOT::timeSet() const {
+  return _timeSet;
+}
+
+// Reset
+void CoogleIOT::restartDevice() {
+  _restarting = true;
+  ESP.restart();
 }
 
 // Logging
-String CoogleIOT::buildLogMsg(String msg, CoogleIOT_LogSeverity severity)
-{
-	switch(severity) {
-		case DEBUG:
-			return "[DEBUG " + TimestampAsString() + "] " + msg;
-			break;
-		case INFO:
-			return "[INFO " + TimestampAsString() + "] " + msg;
-			break;
-		case WARNING:
-			return "[WARNING " + TimestampAsString() + "] " + msg;
-			break;
-		case ERROR:
-			return "[ERROR " + TimestampAsString() + "] " + msg;
-			break;
-		case CRITICAL:
-			return "[CRTICAL " + TimestampAsString() + "] " + msg;
-			break;
-		default:
-			return "[UNKNOWN " + TimestampAsString() + "] " + msg;
-			break;
-	}
+CoogleIOT& CoogleIOT::debug(const __FlashStringHelper* format, ...) {
+  va_list arg;
+  va_start(arg, format);
+  log(F("Debug"), format, arg);
+  va_end(arg);
+  return *this;
 }
 
-CoogleIOT& CoogleIOT::logPrintf(CoogleIOT_LogSeverity severity, const char *format, ...)
-{
-    va_list arg;
-    va_start(arg, format);
-    char temp[64];
-    char* buffer = temp;
-    size_t len = vsnprintf(temp, sizeof(temp), format, arg);
-    va_end(arg);
-
-    if (len > sizeof(temp) - 1) {
-        buffer = new char[len + 1];
-        if (!buffer) {
-            return *this;
-        }
-        va_start(arg, format);
-        vsnprintf(buffer, len + 1, format, arg);
-        va_end(arg);
-    }
-
-    log(String(buffer), severity);
-
-    if (buffer != temp) {
-        delete[] buffer;
-    }
-
-    return *this;
+CoogleIOT& CoogleIOT::info(const __FlashStringHelper* format, ...) {
+  va_list arg;
+  va_start(arg, format);
+  log(F("Info"), format, arg);
+  va_end(arg);
+  return *this;
 }
 
-CoogleIOT& CoogleIOT::debug(String msg)
-{
-	return log(msg, DEBUG);
+CoogleIOT& CoogleIOT::warn(const __FlashStringHelper* format, ...) {
+  va_list arg;
+  va_start(arg, format);
+  log(F("Warning"), format, arg);
+  va_end(arg);
+  return *this;
 }
 
-CoogleIOT& CoogleIOT::info(String msg)
-{
-	return log(msg, INFO);
+CoogleIOT& CoogleIOT::error(const __FlashStringHelper* format, ...) {
+  va_list arg;
+  va_start(arg, format);
+  log(F("Error"), format, arg);
+  va_end(arg);
+  return *this;
 }
 
-CoogleIOT& CoogleIOT::warn(String msg)
-{
-	return log(msg, WARNING);
+CoogleIOT& CoogleIOT::critical(const __FlashStringHelper* format, ...) {
+  va_list arg;
+  va_start(arg, format);
+  log(F("Critical"), format, arg);
+  va_end(arg);
+  return *this;
 }
 
-CoogleIOT& CoogleIOT::error(String msg)
-{
-	return log(msg, ERROR);
-}
-
-CoogleIOT& CoogleIOT::critical(String msg)
-{
-	return log(msg, CRITICAL);
+CoogleIOT& CoogleIOT::notice(const __FlashStringHelper* format, ...) {
+  va_list arg;
+  va_start(arg, format);
+  log(F("Notice"), format, arg);
+  va_end(arg);
+  return *this;
 }
 
 File& CoogleIOT::LogFile()
@@ -201,395 +419,154 @@ File& CoogleIOT::LogFile()
 	return logFile;
 }
 
-String CoogleIOT::Logs()
-{
-	return CoogleIOT::Logs(false);
+CoogleIOT& CoogleIOT::log(const __FlashStringHelper* severity,
+                          const __FlashStringHelper* format, ...) {
+  if (!_serial && !logFile) return *this;
+
+  char stackBuffer[msgBufferLen];
+  std::unique_ptr<char> buffer;
+  buffer.reset(stackBuffer);
+
+  char severityStr[12];
+  auto lenHead = snprintf_P(buffer.get(), msgBufferLen, PSTR("[%s %s] "),
+                            strcpy_P(severityStr, (PGM_P)severity),
+                            timeStampISO8601());
+
+  va_list arg;
+  va_start(arg, format);
+  auto lenMsg = vsnprintf_P(strchr(buffer.get(), 0), msgBufferLen - lenHead, (PGM_P)format, arg);
+  va_end(arg);
+
+  if (lenMsg + lenHead > msgBufferLen - 1) {
+    buffer.reset(new char[lenMsg + lenHead + 1]);
+    if (!buffer) return *this;
+    snprintf_P(buffer.get(), lenMsg + lenHead + 1, PSTR("[%s %s] "),
+               severityStr, timeStampISO8601());
+    va_start(arg, format);
+    vsnprintf(strchr(buffer.get(), 0), lenMsg + 1, (PGM_P)format, arg);
+    va_end(arg);
+  }
+
+  if (_serial) Serial.println(buffer.get());
+
+  if (logFile) {
+    if (logFile.size() + strlen(buffer.get()) > COOGLEIOT_LOGFILE_MAXSIZE) {
+      logFile.close();
+      SPIFFS.remove(COOGLEIOT_SPIFFS_LOGFILE);
+      logFile = SPIFFS.open(COOGLEIOT_SPIFFS_LOGFILE, "a+");
+
+      if (!logFile) {
+        error(F("ERROR Could not open SPIFFS log file!"));
+        return *this;
+      }
+    }
+
+    logFile.println(buffer.get());
+  }
+
+  return *this;
 }
 
-String CoogleIOT::Logs(bool asHTML)
-{
-	String retval;
-
-	if(!logFile || !logFile.size()) {
-		return retval;
-	}
-
-	logFile.seek(0, SeekSet);
-
-	while(logFile.available()) {
-		retval += (char)logFile.read();
-	}
-
-	logFile.seek(0, SeekEnd);
-
-	return retval;
-}
-
-CoogleIOT& CoogleIOT::log(String msg, CoogleIOT_LogSeverity severity)
-{
-	String logMsg = buildLogMsg(msg, severity);
-
-	if(_serial) {
-		Serial.println(logMsg);
-	}
-
-	if(!logFile) {
-		return *this;
-	}
-
-	if((logFile.size() + msg.length()) > COOGLEIOT_LOGFILE_MAXSIZE) {
-
-		logFile.close();
-		SPIFFS.remove(COOGLEIOT_SPIFFS_LOGFILE);
-		logFile = SPIFFS.open(COOGLEIOT_SPIFFS_LOGFILE, "a+");
-
-		if(!logFile) {
-			if(_serial) {
-				Serial.println("ERROR Could not open SPIFFS log file!");
-			}
-			return *this;
-		}
-	}
-
-	logFile.println(logMsg);
-
-	return *this;
-}
-
-bool CoogleIOT::serialEnabled()
+bool CoogleIOT::serialEnabled() const
 {
 	return _serial;
 }
 
-// Loop
-void CoogleIOT::loop()
-{
-	if(sketchTimerTick) {
-		sketchTimerTick = false;
-		sketchTimerCallback();
-	}
-
-	if(heartbeatTick) {
-		heartbeatTick = false;
-		flashStatus(100, 1);
-
-		if((wifiFailuresCount > COOGLEIOT_MAX_WIFI_ATTEMPTS) && (WiFi.status() != WL_CONNECTED)) {
-			info("Failed too many times to establish a WiFi connection. Restarting Device.");
-			restartDevice();
-			return;
-		}
-
-		if((mqttFailuresCount > COOGLEIOT_MAX_MQTT_ATTEMPTS) && !mqttClient.connected()) {
-			info("Failed too many times to establish a MQTT connection. Restarting Device.");
-			restartDevice();
-			return;
-		}
-
-		if(mqttClientActive) {
-			char topic[150];
-			char json[150];
-			
-			snprintf(json, 150, "{ \"timestamp\" : \"%s\", \"ip\" : \"%s\", \"coogleiot_version\" : \"%s\", \"client_id\" : \"%s\" }",
-					TimestampAsString().c_str(),
-					WiFi.localIP().toString().c_str(),
-					COOGLEIOT_VERSION,
-					MQTTClientId());
-
-			snprintf(topic, 150, COOGLEIOT_DEVICE_TOPIC "/%s", MQTTClientId());
-
-			MQTTQueueMessage(topic, mqttQoS, mqttRetain, json);
-		}
-
-	}
-
-	if(wifiMulti.run() != WL_CONNECTED) {
-		if(strlen(RemoteAPName()) > 0) {
-			info("Not connected to WiFi. Attempting reconnection.");
-			if(!connectToSSID()) {
-				wifiFailuresCount++;
-				logPrintf(INFO, "Attempt %d failed. Will attempt %d times before restarting.", wifiFailuresCount, COOGLEIOT_MAX_WIFI_ATTEMPTS);
-				return;
-			}
-		}
-
-	} else {
-
-		wifiFailuresCount = 0;
-
-		if(!mqttClient.connected()) {
-			yield();
-			if(!connectToMQTT()) {
-				mqttFailuresCount++;
-			}
-		}
-
-		if(mqttClientActive) {
-			mqttFailuresCount = 0;
-			MQTTProcessQueue();
-			yield();
-    }
-
-		if(ntpClientActive) {
-			now = time(nullptr);
-
-			if(now) {
-				struct tm* p_tm = localtime(&now);
-
-				if( (p_tm->tm_hour == 12) &&
-					(p_tm->tm_min == 0) &&
-					(p_tm->tm_sec == 6)) {
-					yield();
-					syncNTPTime(COOGLEIOT_TIMEZONE_OFFSET, COOGLEIOT_DAYLIGHT_OFFSET);
-				}
-			}
-		}
-
-		if(firmwareUpdateTick) {
-			firmwareUpdateTick = false;
-
-			checkForFirmwareUpdate();
-
-			if(_serial) {
-				switch(firmwareUpdateStatus) {
-					case HTTP_UPDATE_FAILED:
-						warn("Warning! Failed to update firmware with specified URL");
-						break;
-					case HTTP_UPDATE_NO_UPDATES:
-						info("Firmware update check completed - at current version");
-						break;
-					case HTTP_UPDATE_OK:
-						info("Firmware Updated!");
-						break;
-					default:
-						warn("Warning! No updated performed. Perhaps an invalid URL?");
-						break;
-				}
-			}
-		}
-	}
-
-	yield();
-	webServer->loop();
-
-	yield();
-#ifndef ARDUINO_ESP8266_ESP01
-	if(dnsServerActive) {
-		dnsServer.processNextRequest();
-	}
-#endif
-
-}
-
 CoogleIOT& CoogleIOT::flashSOS()
 {
-	for(int i = 0; i < 3; i++) {
-		flashStatus(200, 3);
-		delay(1000);
-		flashStatus(500, 3);
-		delay(1000);
-		flashStatus(200, 3);
-		delay(5000);
-	}
+  using esp8266::polledTimeout::oneShotMs;  // import the type to the local
+                                            // namespace
+  for (auto i = 3; i; i--) {
+    flashStatus(200, 3);
+    oneShotMs sosWait(1 * 1000);
+    while (!sosWait) yield();
+
+    flashStatus(500, 3);
+    sosWait.reset(1 * 1000);
+    while (!sosWait) yield();
+
+    flashStatus(200, 3);
+    sosWait.reset(5 * 1000);
+    while (!sosWait) yield();
+        }
 
 	return *this;
-}
-
-bool CoogleIOT::mqttActive()
-{
-	return mqttClientActive;
-}
-
-#ifndef ARDUINO_ESP8266_ESP01
-bool CoogleIOT::dnsActive()
-{
-	return dnsServerActive;
-}
-#else
-bool CoogleIOT::dnsActive()
-{
-	return false;
-}
-#endif
-
-bool CoogleIOT::ntpActive()
-{
-	return ntpClientActive;
-}
-
-bool CoogleIOT::firmwareClientActive()
-{
-	return _firmwareClientActive;
-}
-
-bool CoogleIOT::apStatus()
-{
-	return _apStatus;
-}
-
-String CoogleIOT::WiFiStatus()
-{
-    switch(WiFi.status()) {
-        case WL_CONNECTED:
-            return "Connected";
-            break;
-        case WL_NO_SSID_AVAIL:
-            return "No SSID Available";
-            break;
-        case WL_CONNECT_FAILED:
-            return "Failed to Connect";
-            break;
-        case WL_IDLE_STATUS:
-            return "Idle";
-            break;
-        case WL_DISCONNECTED:
-        default:
-            return "Disconnected";
-            break;
-    }
-}
-
-CoogleIOT& CoogleIOT::syncNTPTime(int offsetSeconds, int daylightOffsetSec)
-{
-	if(!WiFi.status() == WL_CONNECTED) {
-		warn("Cannot synchronize time with NTP Servers - No WiFi Connection");
-		return *this;
-	}
-
-	if(_serial) {
-		info("Synchronizing time on device with NTP Servers");
-	}
-
-	configTime(offsetSeconds, daylightOffsetSec, COOGLEIOT_NTP_SERVER_1, COOGLEIOT_NTP_SERVER_2, COOGLEIOT_NTP_SERVER_3);
-
-	for(int i = 0; (i < 10) && !time(nullptr); i++) {
-		delay(1000);
-	}
-
-	if(!(now = time(nullptr))) {
-		warn("Failed to synchronize with time server!");
-	} else {
-		info("Time successfully synchronized with NTP server");
-		ntpClientActive = true;
-	}
-
-	return *this;
-}
-
-CoogleIOT& CoogleIOT::flashStatus(int speed)
-{
-	flashStatus(speed, 5);
-	return *this;
-}
-
-CoogleIOT& CoogleIOT::flashStatus(int speed, int repeat)
-{
-	if(_statusPin > -1) {
-		for(int i = 0; i < repeat; i++) {
-			digitalWrite(_statusPin, LOW);
-			delay(speed);
-			digitalWrite(_statusPin, HIGH);
-			delay(speed);
-		}
-
-		digitalWrite(_statusPin, HIGH);
-	}
-
-	return *this;
-}
-
-// Initialize
-bool CoogleIOT::initialize()
-{
-	if(_statusPin > -1) {
-		pinMode(_statusPin, OUTPUT);
-		flashStatus(COOGLEIOT_STATUS_INIT);
-	}
-
-	info("Coogle IOT v" COOGLEIOT_VERSION " initializing..");
-
-	verifyFlashConfiguration();
-
-	randomSeed(micros());
-
-	eeprom.initialize(COOGLE_EEPROM_EEPROM_SIZE);
-
-	SPIFFS.begin();
-
-	int cfgSize;
-	eeprom.readInt(0, &cfgSize);
-
-	DeserializationError err = DeserializationError::InvalidInput;
-	if (cfgSize || cfgSize <= COOGLE_EEPROM_EEPROM_SIZE) {
-		std::unique_ptr<char[]> buff(new char[cfgSize]);
-		eeprom.readString(sizeof(int), buff.get(), cfgSize);
-		err = deserializeMsgPack(cfgJsonDoc, buff.get(), cfgSize);
-	}
-
-	if (err) {
-		info("EEPROM not initialized for platform, erasing..");
-
-		eeprom.reset();
-		SPIFFS.format();
-
-		deserializeJson(cfgJsonDoc, cfgJsonDefault);
-		writeConfig();
-	}
-
-	cfgJson = cfgJsonDoc.as<JsonObject>();
-
-	logFile = SPIFFS.open(COOGLEIOT_SPIFFS_LOGFILE, "a+");
-
-	if(!logFile) {
-		error("Could not open SPIFFS log file!");
-	} else {
-		info("Log file successfully opened");
-	}
-
-	if(strlen(APName()) > 0) {
-		WiFi.hostname(APName());
-	}
-
-	if(!connectToSSID()) {
-		error("Failed to connect to remote AP");
-	} else {
-
-		syncNTPTime(COOGLEIOT_TIMEZONE_OFFSET, COOGLEIOT_DAYLIGHT_OFFSET);
-
-		if(!initializeMQTT()) {
-			error("Failed to connect to MQTT Server");
-		}
-
-	}
-
-	// Used for callbacks into C, where we can't use std::bind to bind an object method
-	__coogle_iot_self = this;
-
-	enableConfigurationMode();
-
-	if(strlen(FirmwareUpdateUrl()) > 0) {
-		os_timer_setfn(&firmwareUpdateTimer, __coogle_iot_firmware_timer_callback, NULL);
-		os_timer_arm(&firmwareUpdateTimer, COOGLEIOT_FIRMWARE_UPDATE_CHECK_MS, true);
-
-		info("Automatic Firmware Update Enabled");
-
-		_firmwareClientActive = true;
-	}
-
-	os_timer_setfn(&heartbeatTimer, __coogle_iot_heartbeat_timer_callback, NULL);
-	os_timer_arm(&heartbeatTimer, COOGLEIOT_HEARTBEAT_MS, true);
-
-	return true;
-}
-
-void CoogleIOT::restartDevice()
-{
-	_restarting = true;
-	ESP.restart();
 }
 
 CoogleIOT& CoogleIOT::resetEEProm()
 {
-	eeprom.reset();
+	EEPROM.put(0, (uint32_t)0);
+
+	return *this;
+}
+
+bool CoogleIOT::mqttActive() const
+{
+	return mqttClient.connected();
+}
+
+bool CoogleIOT::dnsActive() const
+{
+  #ifndef ARDUINO_ESP8266_ESP01
+		return _dnsServerActive;
+	#else
+		return false;
+	#endif
+}
+
+bool CoogleIOT::firmwareClientActive() const
+{
+	return _firmwareClientActive;
+}
+
+bool CoogleIOT::apStatus() const
+{
+	return _apStatus;
+}
+
+const char* CoogleIOT::WiFiStatus() const
+{
+    switch(WiFi.status()) {
+        case WL_CONNECTED:
+            return  PSTR("Connected");
+            break;
+        case WL_NO_SSID_AVAIL:
+            return  PSTR("The configured SSID cannot be reached");
+            break;
+        case WL_CONNECT_FAILED:
+            return  PSTR("Failed to connect, Invalid secret");
+            break;
+        case WL_IDLE_STATUS:
+            return  PSTR("WiFi is in process of changing between states");
+            break;
+        case WL_DISCONNECTED:
+        default:
+            return  PSTR("Disconnected");
+            break;
+    }
+}
+
+CoogleIOT& CoogleIOT::flashStatus(uint32_t speed) {
+	return flashStatus(speed, 5);
+}
+
+CoogleIOT& CoogleIOT::flashStatus(uint32_t speed, uint32_t repeat) {
+	if (_statusPin > -1) {
+		digitalWrite(_statusPin, LOW);
+
+		uint32_t* left = new uint32_t[1];
+		*left = repeat * 2 - 1;
+		
+		schedule_recurrent_function_us([=]() -> bool {
+			digitalWrite(_statusPin, !digitalRead(_statusPin));
+			if (!--(*left)) {
+				delete left;
+				return false;
+			}
+			else return true;
+		}, speed * 1000);
+	}
+
 	return *this;
 }
 
@@ -599,35 +576,39 @@ bool CoogleIOT::verifyFlashConfiguration()
 	uint32_t ideSize = ESP.getFlashChipSize();
 	FlashMode_t ideMode = ESP.getFlashChipMode();
 
-	debug("Introspecting on-board Flash Memory:");
-	logPrintf(DEBUG, "Flash ID: %08X", ESP.getFlashChipId());
-	logPrintf(DEBUG, "Flash real size: %u", realSize);
-	logPrintf(DEBUG, "Flash IDE Size: %u", ideSize);
-	logPrintf(DEBUG, "Flash IDE Speed: %u", ESP.getFlashChipSpeed());
-	logPrintf(DEBUG, "Flash IDE Mode: %u", (ideMode == FM_QIO ? "QIO" : ideMode == FM_QOUT ? "QOUT" : ideMode == FM_DIO ? "DIO" : ideMode == FM_DOUT ? "DOUT" : "UNKNOWN"));
+	debug(F("Introspecting on-board Flash Memory:"));
+	debug(F("Flash ID: %08X"), ESP.getFlashChipId());
+	debug(F("Flash real size: %u"), realSize);
+	debug(F("Flash IDE Size: %u"), ideSize);
+	debug(F("Flash IDE Speed: %u"), ESP.getFlashChipSpeed());
+	debug(F("Flash IDE Mode: %u"), (ideMode == FM_QIO ? "QIO" : 
+																	ideMode == FM_QOUT ? "QOUT" : 
+																	ideMode == FM_DIO ? "DIO" : 
+																	ideMode == FM_DOUT ? "DOUT" : 
+																	"UNKNOWN"));
 
 	if(ideSize != realSize) {
-		warn("Flashed size is not equal to size available on chip!");
-	} else {
-		debug("Flash Chip Configuration Verified: OK");
+		warn(F("Flashed size is not equal to size available on chip!"));
+		return false;
 	}
-
+		
+	debug(F("Flash Chip Configuration Verified: OK"));
+	return true;
 }
 
 void CoogleIOT::enableConfigurationMode()
 {
-	info("Enabling Configuration Mode");
+	info(F("Enabling Configuration Mode"));
 
 	initializeLocalAP();
 
-	webServer = new CoogleIOTWebserver(*this);
+	webServer = std::unique_ptr<CoogleIOTWebserver>(new CoogleIOTWebserver(*this));
 
-	if(!webServer->initialize()) {
-		error("Failed to initialize configuration web server");
+	if(!webServer || !webServer->initialize()) {
+		error(F("Failed to initialize configuration web server"));
 		flashSOS();
 	}
 }
-
 
 void CoogleIOT::initializeLocalAP()
 {
@@ -636,167 +617,175 @@ void CoogleIOT::initializeLocalAP()
 	IPAddress apGateway(192,168,0,1);
 
 	if(strlen(APPassword()) == 0) {
-		info("No AP Password found in memory");
-		info("Setting to default password: " COOGLEIOT_AP_DEFAULT_PASSWORD);
+		info(F("No AP Password found in memory"));
+		info(F("Setting to default password: " COOGLEIOT_AP_DEFAULT_PASSWORD));
 
 		APPassword(COOGLEIOT_AP_DEFAULT_PASSWORD);
 	}
 
 	if(strlen(APName()) == 0) {
-		info("No AP Name found in memory. Auto-generating AP name.");
+		info(F("No AP Name found in memory. Auto-generating AP name."));
 
 		String localAPName = COOGLEIOT_AP;
 		localAPName.concat((int)random(100000, 999999));
 
-		info("Setting AP Name To: " );
-		info(localAPName);
+		info(F("Setting AP Name To: %s"), localAPName.c_str());
 
 		APName(localAPName.c_str());
 	}
 
-	info("Intiailzing Access Point");
+	info(F("Intiailzing Access Point"));
 
 	WiFi.softAPConfig(apLocalIP, apGateway, apSubnetMask);
 	WiFi.softAP(APName(), APPassword());
 
-	info("Local IP Address: ");
-	info(WiFi.softAPIP().toString());
+	info(F("Local IP Address: %s"), WiFi.softAPIP().toString().c_str());
 
-#ifndef ARDUINO_ESP8266_ESP01
-	if(WiFi.status() != WL_CONNECTED) {
+	#ifndef ARDUINO_ESP8266_ESP01
+		if(WiFi.status() != WL_CONNECTED) {
 
-		info("Initializing DNS Server");
+			info(F("Initializing DNS Server"));
 
-		dnsServer.start(COOGLEIOT_DNS_PORT, "*", WiFi.softAPIP());
-		dnsServerActive = true;
+			dnsServer.start(COOGLEIOT_DNS_PORT, "*", WiFi.softAPIP());
+			_dnsServerActive = true;
 
-	} else {
+		} else {
 
-		info("Disabled DNS Server while connected to WiFI");
-		dnsServerActive = false;
+			info(F("Disabled DNS Server while connected to WiFI"));
+			_dnsServerActive = false;
 
-	}
-#endif
+		}
+	#endif
 
 	_apStatus = true;
 
 }
 
 // Getters
-const char* CoogleIOT::FirmwareUpdateUrl() {
-  return cfgJson["fw_upd_url"].as<const char*>();
+const char* CoogleIOT::FirmwareUpdateUrl() const {
+  return cfgJson[F("fw_upd_url")].as<const char*>();
 }
 
-const char* CoogleIOT::MQTTHostname() {
-  return cfgJson["mqtt"]["host"].as<const char*>();
+const char* CoogleIOT::MQTTHostname() const {
+  return cfgJson[F("mqtt")][F("host")].as<const char*>();
 }
 
-const char* CoogleIOT::MQTTClientId() {
-  return cfgJson["mqtt"]["client_id"].as<const char*>();
+const char* CoogleIOT::MQTTClientId() const {
+  return cfgJson[F("mqtt")][F("client_id")].as<const char*>();
 }
 
-const char* CoogleIOT::MQTTUsername() {
-  return cfgJson["mqtt"]["user"].as<const char*>();
+const char* CoogleIOT::MQTTUsername() const {
+  return cfgJson[F("mqtt")][F("user")].as<const char*>();
 }
 
-const char* CoogleIOT::MQTTPassword() {
-  return cfgJson["mqtt"]["pass"].as<const char*>();
+const char* CoogleIOT::MQTTPassword() const {
+  return cfgJson[F("mqtt")][F("pass")].as<const char*>();
 }
 
-const char* CoogleIOT::MQTTLWTTopic() {
-  return cfgJson["mqtt"]["lwt"]["topic"].as<const char*>();
+const char* CoogleIOT::MQTTLWTTopic() const {
+  return cfgJson[F("mqtt")][F("lwt")][F("topic")].as<const char*>();
 }
 
-const char* CoogleIOT::MQTTLWTMessage() {
-  return cfgJson["mqtt"]["lwt"]["message"].as<const char*>();
+const char* CoogleIOT::MQTTLWTMessage() const {
+  return cfgJson[F("mqtt")][F("lwt")][F("message")].as<const char*>();
 }
 
-int CoogleIOT::MQTTPort() {
-	return cfgJson["mqtt"]["port"].as<int>();
+int CoogleIOT::MQTTPort() const {
+  return cfgJson[F("mqtt")][F("port")].as<int>();
 }
 
-bool CoogleIOT::MQTTRetain() {
+bool CoogleIOT::MQTTRetain() const {
   return mqttRetain;
 }
 
-int CoogleIOT::MQTTQoS() {
+uint8_t CoogleIOT::MQTTQoS() const {
   return mqttQoS;
 }
 
-const char* CoogleIOT::RemoteAPName() {
-  return cfgJson["remote_ap"]["name"].as<const char*>();
+uint8_t CoogleIOT::MQTTQueueSize() const {
+  return mqttQueueSize;
 }
 
-const char* CoogleIOT::RemoteAPPassword() {
-  return cfgJson["remote_ap"]["pass"].as<const char*>();
+const char* CoogleIOT::SSIDName() const {
+  return cfgJson[F("remote_ap")][F("name")].as<const char*>();
 }
 
-const char* CoogleIOT::APName() {
-  return cfgJson["ap"]["name"].as<const char*>();
+const char* CoogleIOT::SSIDPassword() const {
+  return cfgJson[F("remote_ap")][F("pass")].as<const char*>();
 }
 
-const char* CoogleIOT::APPassword() {
-  return cfgJson["ap"]["pass"].as<const char*>();
+const char* CoogleIOT::APName() const {
+  return cfgJson[F("ap")][F("name")].as<const char*>();
+}
+
+const char* CoogleIOT::APPassword() const {
+  return cfgJson[F("ap")][F("pass")].as<const char*>();
 }
 
 // Setters
-CoogleIOT& CoogleIOT::MQTTQoS(int qos) {
+CoogleIOT& CoogleIOT::MQTTQoS(uint8_t qos) {
   mqttQoS = qos;
 
   return *this;
 }
 
+CoogleIOT& CoogleIOT::MQTTQueueSize(uint8_t qSize) {
+  mqttQueueSize = qSize;
+
+  return *this;
+}
+
 CoogleIOT& CoogleIOT::FirmwareUpdateUrl(const char* s, bool writeCfg) {
-  cfgJson["fw_upd_url"] = s;
+  cfgJson[F("fw_upd_url")] = s;
   if (writeCfg) writeConfig();
 
   return *this;
 }
 
 CoogleIOT& CoogleIOT::MQTTClientId(const char* s, bool writeCfg) {
-  cfgJson["mqtt"]["client_id"] = s;
+  cfgJson[F("mqtt")][F("client_id")] = s;
   if (writeCfg) writeConfig();
 
   return *this;
 }
 
 CoogleIOT& CoogleIOT::MQTTHostname(const char* s, bool writeCfg) {
-  cfgJson["mqtt"]["host"] = s;
+  cfgJson[F("mqtt")][F("host")] = s;
   if (writeCfg) writeConfig();
 
   return *this;
 }
 
 CoogleIOT& CoogleIOT::MQTTPort(int port, bool writeCfg) {
-  cfgJson["mqtt"]["port"] = port;
+  cfgJson[F("mqtt")][F("port")] = port;
   if (writeCfg) writeConfig();
 
   return *this;
 }
 
 CoogleIOT& CoogleIOT::MQTTUsername(const char* s, bool writeCfg) {
-  cfgJson["mqtt"]["user"] = s;
+  cfgJson[F("mqtt")][F("user")] = s;
   if (writeCfg) writeConfig();
 
   return *this;
 }
 
 CoogleIOT& CoogleIOT::MQTTPassword(const char* s, bool writeCfg) {
-  cfgJson["mqtt"]["pass"] = s;
+  cfgJson[F("mqtt")][F("pass")] = s;
   if (writeCfg) writeConfig();
 
   return *this;
 }
 
 CoogleIOT& CoogleIOT::MQTTLWTTopic(const char* s, bool writeCfg) {
-  cfgJson["mqtt"]["lwt"]["topic"] = s;
+  cfgJson[F("mqtt")][F("lwt")][F("topic")] = s;
   if (writeCfg) writeConfig();
 
   return *this;
 }
 
 CoogleIOT& CoogleIOT::MQTTLWTMessage(const char* s, bool writeCfg) {
-  cfgJson["mqtt"]["lwt"]["message"] = s;
+  cfgJson[F("mqtt")][F("lwt")][F("message")] = s;
   if (writeCfg) writeConfig();
 
   return *this;
@@ -808,66 +797,88 @@ CoogleIOT& CoogleIOT::MQTTRetain(bool b) {
   return *this;
 }
 
-CoogleIOT& CoogleIOT::RemoteAPName(const char* s, bool writeCfg) {
-  cfgJson["remote_ap"]["name"] = s;
+CoogleIOT& CoogleIOT::SSIDName(const char* s, bool writeCfg) {
+  cfgJson[F("remote_ap")][F("name")] = s;
   if (writeCfg) writeConfig();
 
   return *this;
 }
 
-CoogleIOT& CoogleIOT::RemoteAPPassword(const char* s, bool writeCfg) {
-  cfgJson["remote_ap"]["pass"] = s;
+CoogleIOT& CoogleIOT::SSIDPassword(const char* s, bool writeCfg) {
+  cfgJson[F("remote_ap")][F("pass")] = s;
   if (writeCfg) writeConfig();
 
   return *this;
 }
 
 CoogleIOT& CoogleIOT::APName(const char* s, bool writeCfg) {
-  cfgJson["ap"]["name"] = s;
+  cfgJson[F("ap")][F("name")] = s;
   if (writeCfg) writeConfig();
 
   return *this;
 }
 
 CoogleIOT& CoogleIOT::APPassword(const char* s, bool writeCfg) {
-  cfgJson["ap"]["pass"] = s;
+  cfgJson[F("ap")][F("pass")] = s;
   if (writeCfg) writeConfig();
 
   return *this;
 }
 
 bool CoogleIOT::writeConfig() {
-  int cfgLength = measureMsgPack(cfgJsonDoc);
-  if (cfgLength > COOGLE_EEPROM_EEPROM_SIZE - sizeof(int)) {
-    logPrintf(
-        ERROR,
-        "Config data size (%d) is larger than available EEPROM space (%s)",
-        cfgLength, COOGLE_EEPROM_EEPROM_SIZE - sizeof(int));
+  size_t cfgLength = measureMsgPack(cfgJson);
+
+  if (cfgLength > cfgDataSize) {
+    error(F("Config data size (%d) is larger than available EEPROM space (%s)"),
+          cfgLength, cfgDataSize);
     return false;
   }
 
-  std::unique_ptr<char[]> buff(new char[cfgLength]);
-  eeprom.writeInt(0, cfgLength);
-  serializeMsgPack(cfgJsonDoc, buff.get(), cfgLength);
-  eeprom.writeString(sizeof(int), buff.get(), cfgLength);
+  if (cfgLength == 0) {
+    error(F("Config data size is zero, nothing to write to EEPROM"));
+    return false;
+  }
+
+  char buff[cfgDataSize];
+  EEPROM.put(0, cfgLength);
+  #if COOGLEIOT_USE_MSGPACK
+  serializeMsgPack(cfgJson, buff);
+  #else
+  serializeJson(cfgJson, buff);
+  #endif
+  EEPROM.put(sizeof(cfgLength), buff);
+  EEPROM.commit();
   return true;
 }
 
 // MQTT
-CoogleIOT& CoogleIOT::MQTTSubTopic(const char* topic,
-                                   mqttSubCallback callBack = nullptr) {
-  mqttSubTopicList.emplace_back(mqttSubTopicEntry {topic, callBack});
+CoogleIOT& CoogleIOT::MQTTSubTopic(const char* topic, mqttSubCallback callBack) {
+  if (callBack != nullptr)
+    mqttSubTopicList.emplace_back(mqttSubTopicEntry {topic, callBack});
 
   return *this;
 }
 
-CoogleIOT& CoogleIOT::MQTTQueueMessage(const char* topic, const char* payload) {
-  return CoogleIOT::MQTTQueueMessage(topic, MQTTQoS(), MQTTRetain(), payload);
+CoogleIOT& CoogleIOT::MQTTQueueMessage(const char* topicIn, const char* payloadIn) {
+	std::unique_ptr<char[]> topic(new char[strlen(topicIn) + 1]);
+  std::unique_ptr<char[]> payload(new char[strlen(payloadIn) + 1]);
+	strcpy(topic.get(), topicIn);
+	strcpy(payload.get(), payloadIn);
+  return CoogleIOT::MQTTQueueMessage(std::move(topic), MQTTQoS(), MQTTRetain(),
+																		 std::move(payload));
 }
 
-CoogleIOT& CoogleIOT::MQTTQueueMessage(const char* topic, uint8_t qos,
-                                       bool retain, const char* payload) {
-  mqttPublishQueue.emplace(mqttQueueEntry{topic, payload, qos, retain, 0});
+CoogleIOT& CoogleIOT::MQTTQueueMessage(std::unique_ptr<char[]> topic,
+																			 std::unique_ptr<char[]> payload) {
+  return CoogleIOT::MQTTQueueMessage(std::move(topic), MQTTQoS(), MQTTRetain(), 
+																		 std::move(payload));
+}
+
+CoogleIOT& CoogleIOT::MQTTQueueMessage(std::unique_ptr<char[]> topic, uint8_t qos,
+                                       bool retain, std::unique_ptr<char[]> payload) {
+	while (mqttPublishQueue.size() >= mqttQueueSize) mqttPublishQueue.pop();
+  mqttPublishQueue.emplace(mqttQueueEntry{std::move(topic), std::move(payload),
+																				  qos, retain, 0});
 
   return *this;
 }
@@ -876,8 +887,8 @@ CoogleIOT& CoogleIOT::MQTTProcessQueue() {
   if (!mqttPublishQueue.empty() && mqttClient.connected()) {
 		auto& head = mqttPublishQueue.front();
     if (head.packetId == 0) {
-			auto packetId = mqttClient.publish(head.topic.c_str(), head.qos, head.retain,
-																					head.payload.c_str());
+			auto packetId = mqttClient.publish(head.topic.get(), head.qos, head.retain,
+																				 head.payload.get());
 			if (packetId) head.packetId = packetId;
 		}
   }
@@ -885,55 +896,22 @@ CoogleIOT& CoogleIOT::MQTTProcessQueue() {
   return *this;
 }
 
-void CoogleIOT::checkForFirmwareUpdate()
-{
-	const char* firmwareUrl = FirmwareUpdateUrl();
-
-	if(strlen(firmwareUrl) == 0) {
-		return;
-	}
-
-	info("Checking for Firmware Updates");
-
-	os_intr_lock();
-
-	LUrlParser::clParseURL URL = LUrlParser::clParseURL::ParseURL(firmwareUrl);
-
-	if(!URL.IsValid()) {
-		os_intr_unlock();
-		return;
-	}
-
-	int port;
-	if(!URL.GetPort(&port)) {
-		port = 80;
-	}
-
-	firmwareUpdateStatus = ESPhttpUpdate.update(URL.m_Host.c_str(), port, URL.m_Path.c_str(), COOGLEIOT_VERSION);
-
-	os_intr_unlock();
-}
-
 bool CoogleIOT::initializeMQTT()
 {
 	flashStatus(COOGLEIOT_STATUS_MQTT_INIT);
 
 	if(strlen(MQTTHostname()) == 0) {
-		info("No MQTT Hostname specified. Cannot Initialize MQTT");
-		mqttClientActive = false;
+		info(F("No MQTT Hostname specified. Cannot Initialize MQTT"));
 		return false;
 	}
 
 	if(MQTTPort() == 0) {
-		info("Setting to default MQTT Port");
+		info(F("Setting to default MQTT Port: %d"), COOGLEIOT_DEFAULT_MQTT_PORT);
 		MQTTPort(COOGLEIOT_DEFAULT_MQTT_PORT);
 	}
 
 	if (strlen(MQTTClientId()) == 0) {
-		info(
-				"Setting to default MQTT Client "
-				"ID: " COOGLEIOT_DEFAULT_MQTT_CLIENT_ID);
-
+		info(F("Setting to default MQTT Client ID: %s"), COOGLEIOT_DEFAULT_MQTT_CLIENT_ID);
 		MQTTClientId(COOGLEIOT_DEFAULT_MQTT_CLIENT_ID);
 	}
 
@@ -943,14 +921,18 @@ bool CoogleIOT::initializeMQTT()
 
 	if(strlen(MQTTLWTTopic()) != 0)
 		mqttClient.setWill(MQTTLWTTopic(), mqttQoS, mqttRetain,
-												MQTTLWTMessage());
+											 MQTTLWTMessage());
 
-	mqttClient.onConnect([=](bool sessionPresent) {
-    logPrintf(INFO, "Connected to MQTT broker: %s", MQTTHostname());
+	mqttClient.onConnect([this](bool sessionPresent) {
+    info(F("Connected to MQTT broker: %s"), MQTTHostname());
     for (const auto& s : mqttSubTopicList) {
 			mqttClient.subscribe(s.topic.c_str(), mqttQoS);
-			logPrintf(INFO, "Subscribed to Topic: %s", s.topic.c_str());
+			info(F("Subscribed to Topic: %s"), s.topic.c_str());
 		}
+  });
+
+	mqttClient.onDisconnect([this](AsyncMqttClientDisconnectReason reason) {
+    info(F("Disconnected from MQTT broker %s, Reason: %d"), MQTTHostname(), reason);
   });
 
 	mqttClient.onPublish([=](uint16_t packetId) {
@@ -960,86 +942,91 @@ bool CoogleIOT::initializeMQTT()
 	mqttClient.onMessage([=](char* topic, char* payloadIn, 
 														AsyncMqttClientMessageProperties properties,
                             size_t len, size_t index, size_t total) {
-		auto subMatch = [](const std::string sub, const std::string topic) -> bool {
-				auto splitStr = [](std::string str, const char delim) -> std::vector<std::string> {
-						std::vector<std::string> v;
-						std::string tmp;
-						for(auto i = str.begin(); i <= str.end(); ++i)
-								if(*i != delim && i != str.end()) tmp += *i;
-								else {
-										v.emplace_back(tmp);
-										tmp = ""; 
-								}   
-						return v;
-				};				
-				auto subTok = splitStr(sub,'/');
-				auto topicTok = splitStr(topic,'/');				
-				for (int t = 0; t < subTok.size(); t++) {
-						if (subTok[t] == topicTok[t] || subTok[t] == "+") continue;
-						if (subTok[t] == "#" && t == subTok.size() - 1) return true;
-						return false;
-				}
-				return subTok.size() == topicTok.size();;
-		};
-
 		static std::string payload;
 		static std::vector<bool> pMap;
+    static bool multiPart = false;
 
 		if(len != total) {
-			payload.insert(0,total,' ');
-			std::fill_n(std::back_inserter(pMap), total, false);
-			payload.insert(index,payloadIn,len);
+      if (!multiPart) {
+        payload.insert(0, total, ' ');
+        std::fill_n(std::back_inserter(pMap), total, false);
+        multiPart = true;
+      }
+			payload.insert(index, payloadIn,len);
 			std::fill_n(pMap.begin()+index, len, true);
 			if (!std::all_of(pMap.begin(), pMap.end(), [](bool v) { return v; })) return;
+      multiPart = false;
 		} else
-			payload.assign(payloadIn,len);
+			payload.assign(payloadIn, len);
+
+    auto subMatch = [](const std::string sub, const std::string topic) -> bool {
+      auto splitTopic = [](std::string str) -> std::vector<std::string> {
+          std::vector<std::string> token;
+          size_t pos = 0;
+          while ((pos = str.find("/")) != std::string::npos) {
+            token.emplace_back(str.substr(0, pos));
+            str.erase(0, pos + 1);
+          }
+          token.emplace_back(str);
+          return token;
+      };
+      if (sub == topic) return true;		
+      auto subTok = splitTopic(sub);
+      auto topicTok = splitTopic(topic);				
+      for (unsigned int t = 0; t < subTok.size(); t++) {
+          if (subTok[t] == topicTok[t] || subTok[t] == "+") continue;
+          if (subTok[t] == "#" && t == subTok.size() - 1) return true;
+          return false;
+      }
+      return subTok.size() == topicTok.size();
+		};
 
 		for (const auto& subT : mqttSubTopicList)
-			if (subT.callBack != nullptr && subMatch(subT.topic,topic))
-				subT.callBack(topic,payload.c_str(),properties);
-
-		payload.clear(); pMap.clear();
-		payload.shrink_to_fit(); pMap.shrink_to_fit();
+			if (subMatch(subT.topic, topic))
+        subT.callBack(topic, payload.c_str(), properties);
 	});
 
-  return connectToMQTT();
+  return true;
 }
 
-AsyncMqttClient* CoogleIOT::getMQTTClient() { return &mqttClient; }
+AsyncMqttClient* CoogleIOT::MQTTClient()
+{ 
+	return &mqttClient;
+}
 
 bool CoogleIOT::connectToMQTT()
 {
 	if(mqttClient.connected()) {
-		mqttClientActive = true;
 		return true;
 	}
 
+	if (_mqttConnecting == true) {
+		return false;
+	}
+
 	if(WiFi.status() != WL_CONNECTED) {
-		info("Cannot connect to MQTT because there is no WiFi Connection");
-		mqttClientActive = false;
+		info(F("Cannot connect to MQTT because there is no WiFi Connection"));
 		return false;
 	}
 
 	if(strlen(MQTTHostname()) == 0) {
-		mqttClientActive = false;
 		return false;
 	}
 
-	info("Attempting to Connect to MQTT Server");
+	info(F("Attempting to Connect to MQTT Server"));
+  debug(F("MQTT Broker: %s : %d"), MQTTHostname(), MQTTPort());
 
-	mqttClient.connect();
-  delay(2000);
+  schedule_recurrent_function_us([this](){
+		if (mqttClient.connected()) {
+			_mqttConnecting = false;
+			return false;
+		}
 
-  logPrintf(DEBUG, "Host: %s : %d",MQTTHostname(), MQTTPort());
-
-	if(!mqttClient.connected()) {
-		error("Failed to connect to MQTT Server!");
-		mqttClientActive = false;
-		return false;
-	}
-
-	info("MQTT Client Initialized");
-	mqttClientActive = true;
+		mqttClient.connect();
+		_mqttConnecting = true;
+		return true;
+	}, 2 * 1000 * 1000);
+	
 	return true;
 }
 
@@ -1047,51 +1034,19 @@ bool CoogleIOT::connectToSSID()
 {
 	flashStatus(COOGLEIOT_STATUS_WIFI_INIT);
 
-	if(strlen(RemoteAPName()) == 0) {
-		info("Cannot connect WiFi client, no remote AP specified");
+	if(strlen(SSIDName()) == 0) {
+		info(F("Cannot connect WiFi client, no SSID specified"));
 		return false;
 	}
 
-	info("Connecting to remote AP");
+	info(F("Connecting to SSID %s"), SSIDName());
 
-	if(strlen(RemoteAPPassword()) == 0) {
-		warn("No Remote AP Password Specified!");
-  	wifiMulti.addAP(RemoteAPName(), NULL);
+	if(strlen(SSIDPassword()) == 0) {
+		warn(F("No SSID Password Specified!"));
+  	wifiMulti.addAP(SSIDName(), NULL);
 	} else {
-		wifiMulti.addAP(RemoteAPName(), RemoteAPPassword());
+		wifiMulti.addAP(SSIDName(), SSIDPassword());
 	}
-
-  int waitLoop = 50;
-  while (int wifiStatus = wifiMulti.run() != WL_CONNECTED && waitLoop) {
-    if (wifiStatus == WL_CONNECT_FAILED) {
-      error("Invalid secret");
-			break;
-    }
-    switch (wifiStatus) {
-      case WL_IDLE_STATUS:    info("Status: Wi-Fi is in process of changing between statuses");
-                              break;
-      case WL_NO_SSID_AVAIL:  info("Status: configured SSID cannot be reached");
-                              break;
-      case WL_CONNECTED:      info("Status: successful connection is established");
-                              break;
-      case WL_DISCONNECTED:   info("Status: module is not configured in station mode");
-                              break;
-      default: break;
-    }
-    delay(500);
-    waitLoop--;
-  }
-
-	if(WiFi.status() != WL_CONNECTED) {
-		error("Could not connect to Access Point!");
-		flashSOS();
-
-		return false;
-	}
-
-	info("Connected to Remote Access Point!");
-	info("Our IP Address is:");
-	info(WiFi.localIP().toString());
 
 	return true;
 }
@@ -1101,50 +1056,12 @@ CoogleIOT& CoogleIOT::enableSerial()
 	return enableSerial(115200);
 }
 
-CoogleIOT& CoogleIOT::enableSerial(int baud)
-{
-    if(!Serial) {
+CoogleIOT& CoogleIOT::enableSerial(uint32_t baud) {
+  if (!Serial) {
+    Serial.begin(baud, SERIAL_8N1, SERIAL_FULL);
+    while (!Serial) yield();
+  }
 
-      Serial.begin(baud);
-
-      while(!Serial) {
-          yield();
-      }
-
-    }
-
-    _serial = true;
-    return *this;
-}
-
-CoogleIOT& CoogleIOT::enableSerial(int baud, SerialConfig config)
-{
-    if(!Serial) {
-
-      Serial.begin(baud, config);
-
-      while(!Serial) {
-          yield();
-      }
-
-    }
-
-    _serial = true;
-    return *this;
-}
-
-CoogleIOT& CoogleIOT::enableSerial(int baud, SerialConfig config, SerialMode mode)
-{
-    if(!Serial) {
-
-      Serial.begin(baud, config, mode);
-
-      while(!Serial) {
-          yield();
-      }
-
-    }
-
-    _serial = true;
-    return *this;
+  _serial = true;
+  return *this;
 }

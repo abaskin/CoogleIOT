@@ -24,13 +24,12 @@
 #define COOGLEIOT_WEBSERVER_H
 
 #include <ESP8266WebServer.h>
-#include <ESP8266mDNS.h>
 #include "CoogleIOT.h"
 #include "CoogleIOTConfig.h"
 #include "DNSServer/DNSServer.h"
 #include "WiFiClientPrint.h"
 
-#include <ArduinoJson.h>  //https://github.com/bblanchon/ArduinoJson
+#include <memory>
 
 #include "webpages/home.h"
 #include "webpages/mini_css_default.h"
@@ -46,12 +45,8 @@ class CoogleIOTWebserver
 		CoogleIOTWebserver(CoogleIOT& _iot);
 		CoogleIOTWebserver(CoogleIOT& _iot, int port);
 		~CoogleIOTWebserver();
-		CoogleIOTWebserver& setIOT(CoogleIOT& _iot);
-		CoogleIOTWebserver& setWebserver(ESP8266WebServer* server);
-		CoogleIOTWebserver& setServerPort(int port);
 
-		String htmlEncode(String);
-		String htmlEncode(const char *);
+		String htmlEncode(String) const;
 
 		bool initialize();
 		void handleRoot();
@@ -73,7 +68,7 @@ class CoogleIOTWebserver
 	protected:
 		CoogleIOTWebserver& initializePages();
 	private:
-		ESP8266WebServer* webServer;
+		std::unique_ptr<ESP8266WebServer> webServer;
 		CoogleIOT* iot;
 		bool _manualFirmwareUpdateSuccess = false;
 		int serverPort = 80;
